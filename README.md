@@ -194,6 +194,56 @@ python3 x120x_dashboard.py --demo
 python3 x120x_dashboard.py --demo --once
 ```
 
+## Estimated battery runtime versus shutdown timer
+
+The dashboard shows two independent values:
+
+- **Est. battery runtime** (on battery) or **Est. battery backup** (on mains): a
+  rough estimate of energy available above the configured percentage reserve.
+- **Shutdown timer limit / remaining**: the actual maximum-time-on-battery policy.
+  A two-hour battery estimate does not extend a five-minute shutdown timer.
+
+The display-only estimate defaults to two 3000mAh, 3.7V cells (22.2Wh nominal), an
+**assumed total load of 5W** and **assumed conversion efficiency of 85%**. The
+assumptions appear next to the estimate; they are not measurements. It uses the
+current battery percentage, even when that is above the configured charge target.
+At 80% charge with a 20% reserve, the model gives about 2h 15m. Durations are rounded
+to five minutes to avoid implying measurement precision.
+
+```text
+hours = nominal_pack_Wh × max(0, current_percent - reserve_percent) / 100
+        × assumed_efficiency / assumed_total_load_W
+```
+
+The 3.5V limit may be reached before the percentage reserve, so actual usable time
+can be shorter. Battery age, fuel-gauge error, temperature and changing SSD/CPU
+loads are not modelled. If the configured percentage or voltage threshold is
+already reached, the estimate is zero. Missing, stale or failed service data gives
+`Unavailable`. This is not a measured time-to-empty or a guarantee of backup time.
+It does not use the PMIC rail estimate as total system power.
+
+To change only the displayed assumptions:
+
+```sh
+x120x-dashboard --battery-wh 22.2 --load-watts 5 --efficiency 0.85
+```
+
+These options do not write configuration or affect charging, shutdown, GPIO or
+Telegram. Use a measured total-load figure if available; do not substitute the
+incomplete PMIC reading for total Pi/SSD power.
+
+For an existing installation, this feature can be updated without stopping the
+UPS service. After restoring external power and reconnecting to the Pi:
+
+```sh
+cd ~/x120x_term-control-dash
+git pull --ff-only
+sudo install -m 755 x120x_dashboard.py /usr/local/bin/x120x-dashboard
+x120x-dashboard
+```
+
+Only the dashboard is replaced by those commands; no service restart is needed.
+
 ## Optional Telegram power alerts
 
 Telegram alerts are **disabled by default** and outbound-only. They cannot

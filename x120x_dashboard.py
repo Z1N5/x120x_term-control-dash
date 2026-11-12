@@ -2,6 +2,7 @@
 """Read-only X120X terminal dashboard. No GPIO writes or shutdown commands."""
 import argparse
 import curses
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -111,7 +112,55 @@ def boolean(value, yes, no):
     return yes if value is True else no if value is False else 'Unknown'
 
 
-def rows(report, pi, demo=False):
+@dataclass(frozen=True)
+class RuntimeModel:
+    # Defaults describe two 3000mAh, 3.7V cells, not measured pack capacity.
+    battery_wh: float = 22.2
+    load_watts: float = 5.0
+    efficiency: float = .85
+
+    def validate(self):
+        if not all(math.isfinite(value) and value > 0 for value in
+                   (self.battery_wh, self.load_watts, self.efficiency)):
+            raise ValueError('Battery Wh, assumed total load and efficiency must be positive and finite')
+        if self.efficiency > 1:
+            raise ValueError('Efficiency must be a fraction greater than 0 and at most 1')
+
+    def estimate_hours(self, report):
+        self.validate()
+        if report.get('health') != 'ok' or report.get('stale', True):
+            return None
+        capacity = report.get('current_capacity')
+        reserve = report.get('min_capacity')
+        voltage = report.get('current_voltage')
+        cutoff = report.get('min_voltage')
+        values = (capacity, reserve, voltage, cutoff)
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+               or not math.isfinite(value) for value in values):
+            return None
+        if not (0 <= capacity <= 110 and 0 <= reserve <= 100 and voltage > 0 and cutoff >= 0):
+            return None
+        if cutoff and voltage <= cutoff:
+            return 0.0
+        usable_fraction = max(0, min(100, capacity) - reserve) / 100
+        hours = self.battery_wh * usable_fraction * self.efficiency / self.load_watts
+        return hours if math.isfinite(hours) else None
+
+
+def runtime_text(hours):
+    if hours is None:
+        return 'Unavailable'
+    if hours <= 0:
+        return '0 min (battery threshold reached)'
+    if hours * 60 < 5:
+        return 'under 5 min (rough estimate)'
+    minutes = round(hours * 60 / 5) * 5
+    whole_hours, remainder = divmod(minutes, 60)
+    duration = (f'{whole_hours}h {remainder:02d}m' if whole_hours else f'{remainder} min')
+    return '~' + duration
+
+
+def rows(report, pi, demo=False, runtime_model=None):
     """Text plus semantic colour; shared by curses and --once."""
     lines = [('X120X UPS / RASPBERRY PI 5' + (' [DEMO]' if demo else ''), 'title')]
     health = report.get('health', 'unknown')
@@ -133,6 +182,17 @@ def rows(report, pi, demo=False):
         filled = round(min(100, max(0, capacity)) / 100 * 26)
         lines.append(('                   [' + '#' * filled + '-' * (26-filled) + ']',
                       'good' if capacity > 25 else 'warn'))
+    model = RuntimeModel() if runtime_model is None else runtime_model
+    hours = model.estimate_hours(report)
+    label = 'Est. battery backup: ' if report.get('charger_present') is True else 'Est. battery runtime: '
+    lines.extend([
+        (label + runtime_text(hours), 'normal'),
+        ('Estimate basis: ' + f'{model.battery_wh:g}Wh / assumed {model.load_watts:g}W total / '
+         f'{model.efficiency:.0%} efficiency', 'normal'),
+        ('To ' + fmt(report.get('min_capacity'), '%', 0) +
+         ' reserve; voltage cutoff may stop it sooner.', 'normal'),
+        ('Estimate only; the separate shutdown timer still applies.', 'normal'),
+    ])
     lines.extend([
         ('Charging switch:   ' + boolean(report.get('charging_enabled'), 'ENABLED', 'DISABLED'), 'normal'),
         ('Charge limit:      ' + fmt(report.get('max_capacity'), '%', 0) + ' (configured)', 'normal'),
@@ -167,13 +227,16 @@ def rows(report, pi, demo=False):
          ' | dropped: ' + str(report.get('telegram_dropped', 0)), 'normal'),
     ])
     limit = report.get('outage_limit_seconds')
-    lines.append(('Battery runtime limit: ' + (fmt(limit / 60, ' minutes', 2)
+    lines.append(('Shutdown timer limit: ' + (fmt(limit / 60, ' minutes', 2)
                   if isinstance(limit, (int, float)) else 'Disabled / unavailable'), 'normal'))
     lines.append(('Low-battery cutoff: ' + fmt(report.get('min_capacity'), '%', 0) + ' or ' +
                   fmt(report.get('min_voltage'), ' V', 2) + ' (immediate if shutdown ON)', 'normal'))
     remaining_runtime = report.get('battery_runtime_remaining_seconds')
-    if remaining_runtime is not None:
-        lines.append(('Battery runtime remaining: ' + fmt(remaining_runtime, ' seconds', 0), 'warn'))
+    if remaining_runtime is not None and report.get('automatic_shutdown') is True:
+        if usable:
+            remaining_runtime = max(0, remaining_runtime - report.get('age_seconds', 0))
+        lines.append(('Shutdown timer remaining: ' + fmt(remaining_runtime, ' seconds', 0) +
+                      ('' if usable else ' (UNVERIFIED)'), 'warn'))
     if report.get('shutdown_recommended'):
         lines.append(('Shutdown condition: ' + report['shutdown_recommended'], 'bad'))
         if report.get('automatic_shutdown') is False:
@@ -227,7 +290,7 @@ def display(screen, args):
     while True:
         if time.monotonic() >= refresh_at:
             report, pi = demo_data() if args.demo else (read_status(args.status), pi_metrics())
-            content = rows(report, pi, args.demo)
+            content = rows(report, pi, args.demo, args.runtime_model)
             refresh_at = time.monotonic() + args.interval
         height, width = screen.getmaxyx()
         offset = min(max(0, offset), max(0, len(content) - max(1, height-1)))
@@ -267,12 +330,23 @@ def main():
     parser.add_argument('--demo', action='store_true', help='Use clearly labelled sample data; no hardware access')
     parser.add_argument('--once', action='store_true', help='Print one plain-text report')
     parser.add_argument('--interval', type=float, default=2)
+    parser.add_argument('--battery-wh', type=float, default=22.2,
+                        help='Nominal pack Wh for display estimate only (default: 22.2, two 3000mAh 3.7V cells)')
+    parser.add_argument('--load-watts', type=float, default=5,
+                        help='Assumed TOTAL Pi/accessory watts for display estimate only (default: 5)')
+    parser.add_argument('--efficiency', type=float, default=.85,
+                        help='Assumed conversion efficiency fraction for display estimate only (default: 0.85)')
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval < 1:
         parser.error('--interval must be at least one second')
+    args.runtime_model = RuntimeModel(args.battery_wh, args.load_watts, args.efficiency)
+    try:
+        args.runtime_model.validate()
+    except ValueError as error:
+        parser.error(str(error))
     if args.once:
         report, pi = demo_data() if args.demo else (read_status(args.status), pi_metrics())
-        print('\n'.join(line for line, _ in rows(report, pi, args.demo)))
+        print('\n'.join(line for line, _ in rows(report, pi, args.demo, args.runtime_model)))
     elif not sys.stdout.isatty() or not sys.stdin.isatty():
         parser.error('An interactive terminal is required; use --once for plain text')
     else:
