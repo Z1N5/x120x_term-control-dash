@@ -194,6 +194,56 @@ python3 x120x_dashboard.py --demo
 python3 x120x_dashboard.py --demo --once
 ```
 
+## Dashboard version and update checks
+
+The dashboard displays its embedded version at the top and in the terminal footer.
+This identifies the running dashboard file, not merely the Git checkout's state.
+The first numbered dashboard publication is **v1.0.0**.
+
+Interactive mode checks the public GitHub `VERSION` file in a background thread
+on startup and every six hours. Press **u** to request another check (with a
+10-second cooldown). It displays whether the numbered publication is current,
+a newer version is available, or the check could not be completed. A failed check
+never claims the installation is up to date. Version matching is not a checksum
+verification of local changes or a check of the daemon's installed files.
+
+Only a short public version string is fetched. No GitHub authentication, bot
+credentials or device information are sent. No code is fetched or executed, no
+files are written, and nothing is installed or restarted automatically. Network
+problems cannot block the dashboard or UPS service.
+
+```sh
+x120x-dashboard --version
+x120x-dashboard --check-updates
+x120x-dashboard --no-update-check
+```
+
+`--check-updates` prints installed/update status and exits without hardware
+access. `--no-update-check` prevents dashboard GitHub requests, including via the
+**u** key. Demo and `--once` modes are offline by default. Normal mode checks do
+not change UPS settings.
+
+To install only the latest dashboard, keeping the service running:
+
+```sh
+cd ~/x120x_term-control-dash
+git pull --ff-only
+sudo install -m 755 x120x_dashboard.py /usr/local/bin/x120x-dashboard
+x120x-dashboard
+```
+
+For maintainers: increment both `DASHBOARD_VERSION` in `x120x_dashboard.py` and
+`VERSION` together for each numbered publication. The version synchronisation
+test enforces that they agree. The version file tracks numbered publications on
+`main`; unversioned commits do not produce a newer-version notice. There is no
+Git dependency at runtime and the update checker does not run `git pull`.
+
+The bottom of the dashboard links to this project and credits the public source
+projects [ArjenR/x120x_upsd](https://github.com/ArjenR/x120x_upsd) and
+[Suptronics/x120x](https://github.com/suptronics/x120x).
+
+**Created by z1n5 — [zing.co.uk](https://zing.co.uk).**
+
 ## Estimated battery runtime versus shutdown timer
 
 The dashboard shows two independent values:

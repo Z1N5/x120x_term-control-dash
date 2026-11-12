@@ -9,9 +9,80 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
+from urllib.request import Request, urlopen
 
 DEFAULT_STATUS = '/run/x120x-ups/status.json'
+DASHBOARD_VERSION = '1.0.0'
+REPOSITORY_URL = 'https://github.com/Z1N5/x120x_term-control-dash'
+VERSION_URL = 'https://raw.githubusercontent.com/Z1N5/x120x_term-control-dash/main/VERSION'
+
+
+def version_tuple(value):
+    match = re.fullmatch(r'v?([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})', value.strip())
+    if not match:
+        raise ValueError('Invalid published version')
+    return tuple(int(part) for part in match.groups())
+
+
+def latest_version():
+    # Public version text only: no keys, Git credentials or device details sent.
+    request = Request(VERSION_URL, headers={
+        'User-Agent': 'x120x-term-control-dash/' + DASHBOARD_VERSION,
+        'Cache-Control': 'no-cache'})
+    with urlopen(request, timeout=4) as response:
+        value = response.read(65).decode('ascii').strip()
+    version_tuple(value)
+    return value.lstrip('v')
+
+
+def update_message(published):
+    comparison = version_tuple(published)
+    installed = version_tuple(DASHBOARD_VERSION)
+    if comparison > installed:
+        return ('Update: v' + published.lstrip('v') + ' available on GitHub (manual install)', 'warn')
+    if comparison == installed:
+        return ('Update: up to date (GitHub version checked)', 'good')
+    return ('Update: installed version is newer than GitHub publication', 'normal')
+
+
+class UpdateChecker:
+    """Background read-only checks; no Git commands, installs or local writes."""
+    def __init__(self, enabled=True, fetch=latest_version):
+        self.enabled = enabled
+        self.fetch = fetch
+        self.lock = threading.Lock()
+        self.thread = None
+        self.last_attempt = None
+        self.message = ('Update: not checked yet', 'normal') if enabled else ('Update check: off', 'normal')
+
+    def refresh(self, force=False, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if not self.enabled or (self.thread is not None and self.thread.is_alive()):
+                return False
+            interval = 10 if force else 6 * 60 * 60
+            if self.last_attempt is not None and now - self.last_attempt < interval:
+                return False
+            self.last_attempt = now
+            self.message = ('Update: checking GitHub...', 'normal')
+            self.thread = threading.Thread(target=self._check, name='dashboard-update-check', daemon=True)
+            self.thread.start()
+            return True
+
+    def _check(self):
+        try:
+            message = update_message(self.fetch())
+        except Exception:
+            # Do not surface URLs, network details or response contents as errors.
+            message = ('Update: check unavailable (offline or GitHub unavailable)', 'warn')
+        with self.lock:
+            self.message = message
+
+    def snapshot(self):
+        with self.lock:
+            return self.message
 
 
 def read_command(args):
@@ -160,9 +231,11 @@ def runtime_text(hours):
     return '~' + duration
 
 
-def rows(report, pi, demo=False, runtime_model=None):
+def rows(report, pi, demo=False, runtime_model=None, update_status=None):
     """Text plus semantic colour; shared by curses and --once."""
     lines = [('X120X UPS / RASPBERRY PI 5' + (' [DEMO]' if demo else ''), 'title')]
+    lines.append(('Dashboard version: v' + DASHBOARD_VERSION, 'normal'))
+    lines.append(update_status if update_status is not None else ('Update: not checked', 'normal'))
     health = report.get('health', 'unknown')
     usable = health == 'ok' and not report.get('stale', True)
     lines.append((f"Service: {health.upper()} | " + ('LIVE' if usable else 'READINGS UNVERIFIED'),
@@ -250,7 +323,12 @@ def rows(report, pi, demo=False, runtime_model=None):
     lines.extend([('', 'normal'),
                   ('Charge switch state does not measure battery charging current.', 'normal'),
                   ('PMIC estimate excludes unmeasured loads; not total PSU/SSD power.', 'normal'),
-                  ('q: quit  r: refresh  arrows/PageUp/PageDown: scroll', 'normal')])
+                  ('', 'normal'),
+                  ('Project: ' + REPOSITORY_URL, 'normal'),
+                  ('Based on ArjenR: https://github.com/ArjenR/x120x_upsd', 'normal'),
+                  ('Original Suptronics: https://github.com/suptronics/x120x', 'normal'),
+                  ('Created by z1n5 | https://zing.co.uk', 'title'),
+                  ('q: quit  r: refresh  u: check updates  arrows/PageUp/PageDown: scroll', 'normal')])
     return lines
 
 
@@ -288,9 +366,10 @@ def display(screen, args):
     refresh_at = 0
     content = []
     while True:
+        args.update_checker.refresh()
         if time.monotonic() >= refresh_at:
             report, pi = demo_data() if args.demo else (read_status(args.status), pi_metrics())
-            content = rows(report, pi, args.demo, args.runtime_model)
+            content = rows(report, pi, args.demo, args.runtime_model, args.update_checker.snapshot())
             refresh_at = time.monotonic() + args.interval
         height, width = screen.getmaxyx()
         offset = min(max(0, offset), max(0, len(content) - max(1, height-1)))
@@ -303,7 +382,7 @@ def display(screen, args):
                 except curses.error:
                     pass
         if height > 1 and width > 1:
-            footer = f'Read-only | q quit | scroll {offset+1}/{len(content)}'
+            footer = f'v{DASHBOARD_VERSION} | Read-only | q quit | u updates | scroll {offset+1}/{len(content)}'
             try:
                 screen.addnstr(height-1, 0, footer, width-1, curses.A_REVERSE)
             except curses.error:
@@ -313,6 +392,9 @@ def display(screen, args):
         if key in (ord('q'), ord('Q'), 27):
             break
         if key in (ord('r'), ord('R')):
+            refresh_at = 0
+        elif key in (ord('u'), ord('U')):
+            args.update_checker.refresh(force=True)
             refresh_at = 0
         elif key in (curses.KEY_DOWN, ord('j')):
             offset += 1
@@ -326,6 +408,9 @@ def display(screen, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version='x120x-dashboard ' + DASHBOARD_VERSION)
+    parser.add_argument('--no-update-check', action='store_true', help='Disable all dashboard GitHub checks')
+    parser.add_argument('--check-updates', action='store_true', help='Check the public GitHub version and exit; no hardware access')
     parser.add_argument('--status', default=DEFAULT_STATUS)
     parser.add_argument('--demo', action='store_true', help='Use clearly labelled sample data; no hardware access')
     parser.add_argument('--once', action='store_true', help='Print one plain-text report')
@@ -337,6 +422,17 @@ def main():
     parser.add_argument('--efficiency', type=float, default=.85,
                         help='Assumed conversion efficiency fraction for display estimate only (default: 0.85)')
     args = parser.parse_args()
+    if args.check_updates:
+        if args.no_update_check:
+            parser.error('--check-updates and --no-update-check cannot be combined')
+        print('Installed dashboard: v' + DASHBOARD_VERSION)
+        try:
+            print(update_message(latest_version())[0])
+        except Exception:
+            print('Update: check unavailable (offline or GitHub unavailable)')
+            return 1
+        return 0
+    args.update_checker = UpdateChecker(enabled=not (args.no_update_check or args.demo or args.once))
     if not math.isfinite(args.interval) or args.interval < 1:
         parser.error('--interval must be at least one second')
     args.runtime_model = RuntimeModel(args.battery_wh, args.load_watts, args.efficiency)
@@ -346,7 +442,8 @@ def main():
         parser.error(str(error))
     if args.once:
         report, pi = demo_data() if args.demo else (read_status(args.status), pi_metrics())
-        print('\n'.join(line for line, _ in rows(report, pi, args.demo, args.runtime_model)))
+        print('\n'.join(line for line, _ in rows(report, pi, args.demo, args.runtime_model,
+                                               args.update_checker.snapshot())))
     elif not sys.stdout.isatty() or not sys.stdin.isatty():
         parser.error('An interactive terminal is required; use --once for plain text')
     else:
@@ -357,4 +454,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
