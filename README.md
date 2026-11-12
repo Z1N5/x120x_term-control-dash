@@ -63,6 +63,12 @@ I2C must already be enabled, with the UPS fuel gauge at bus 1, address `0x36`.
 This installer does not change those settings. If GPIO 6 isn't already an input,
 the service reports an error rather than silently reconfiguring it.
 
+GPIO 16 can initially appear as `no ... | --` (`none`) on Pi 5. Monitor-only mode
+accepts this and displays the charging switch as `Unknown`; it does not configure
+the pin. After the double-confirmed charging opt-in, the policy configures GPIO 16
+according to the charge limits. An unknown initial switch in the 77–80% hysteresis
+band is conservatively initialised to disabled until the resume threshold is met.
+
 ### Enable 80% charging control
 
 ```sh

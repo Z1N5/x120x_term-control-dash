@@ -36,6 +36,29 @@ class PolicyTests(unittest.TestCase):
         self.charge.assert_not_called()
         self.shutdown.assert_not_called()
 
+    def test_unknown_charge_switch_in_monitor_mode_is_preserved_without_writes(self):
+        controller = self.make()
+        result = controller.tick(sample(charging_enabled=None), 0, 100)
+        self.assertIsNone(result['charging_enabled'])
+        self.assertIsNone(result['charger_charging'])
+        self.charge.assert_not_called()
+        self.shutdown.assert_not_called()
+
+    def test_authorised_charging_initialises_unknown_switch_using_thresholds(self):
+        for capacity, expected in ((70, True), (77, True), (79, False), (80, False), (90, False)):
+            with self.subTest(capacity=capacity):
+                controller = self.make(control_charging=True)
+                result = controller.tick(sample(charging_enabled=None, current_capacity=capacity), 0, 100)
+                self.charge.assert_called_once_with(expected)
+                # A command is not a measured switch level.
+                self.assertIsNone(result['charging_enabled'])
+
+    def test_unknown_charge_switch_does_not_block_low_battery_shutdown(self):
+        controller = self.make(automatic_shutdown=True)
+        controller.tick(sample(charging_enabled=None, charger_present=False, current_capacity=20), 0, 100)
+        self.shutdown.assert_called_once()
+        self.charge.assert_not_called()
+
     def test_charge_limit_and_hysteresis(self):
         controller = self.make(control_charging=True)
         controller.tick(sample(current_capacity=80), 0, 10)
@@ -170,6 +193,16 @@ class PolicyTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_pi5_unconfigured_charge_pin_is_unknown_not_a_read_failure(self):
+        output = ' 6: ip    pu | hi // GPIO6 = input\n16: no    pd | -- // GPIO16 = none\n'
+        self.assertEqual(ups.parse_gpio(output), (True, None))
+        self.assertEqual(ups.parse_gpio(output.replace('| hi', '| lo')), (False, None))
+
+    def test_unconfigured_and_alternate_charge_modes_never_claim_a_switch_state(self):
+        for state in ('no pd | --', 'no pd | hi', 'a0 pn | lo', 'op dh pn | --'):
+            with self.subTest(state=state):
+                self.assertEqual(ups.parse_gpio('6: ip pu | hi\n16: ' + state), (True, None))
+
     def test_realistic_pinctrl_output(self):
         output = ' 6: ip    pd | hi // GPIO6 = input\n16: op dh pn | hi // GPIO16 = output\n'
         self.assertEqual(ups.parse_gpio(output), (True, False))
@@ -328,6 +361,12 @@ class ConfirmationTests(unittest.TestCase):
 
 
 class DashboardTests(unittest.TestCase):
+    def test_unknown_charging_switch_is_displayed_as_unknown(self):
+        report, metrics = dashboard.demo_data()
+        report['charging_enabled'] = None
+        text = '\n'.join(line for line, _ in dashboard.rows(report, metrics))
+        self.assertIn('Charging switch:   Unknown', text)
+
     def test_pmic_pairs_and_units(self):
         data = dashboard.parse_pmic('VDD_CORE_A current(0)=1.5A\nVDD_CORE_V volt(0)=0.8V\nEXT5V_V volt(1)=5.1V\n')
         self.assertAlmostEqual(data['pmic_watts'], 1.2)

@@ -138,14 +138,21 @@ def atomic_json(path, report):
 def parse_gpio(output):
     states = {}
     for line in output.splitlines():
-        match = re.match(r'\s*(\d+):\s+(\S+).*\|\s*(hi|lo)\b', line)
+        match = re.match(r'\s*(\d+):\s+(\S+).*\|\s*(hi|lo|--)(?=\s|$)', line)
         if match:
-            states[int(match[1])] = (match[2], match[3] == 'hi')
+            level = None if match[3] == '--' else match[3] == 'hi'
+            states[int(match[1])] = (match[2], level)
     if 6 not in states or 16 not in states:
         raise ValueError('Cannot read GPIO 6 and 16 from pinctrl output')
     if states[6][0] != 'ip':
         raise ValueError('GPIO 6 is not an input; refusing an unreliable power reading')
-    return states[6][1], not states[16][1]
+    if states[6][1] is None:
+        raise ValueError('GPIO 6 has no readable level; external power state is unknown')
+    # Pi 5 may leave GPIO 16 in "no" (none) mode before explicit control.
+    # This does not invalidate GPIO 6 or grant permission to configure GPIO 16.
+    mode, level = states[16]
+    enabled = None if mode not in ('ip', 'op') or level is None else not level
+    return states[6][1], enabled
 
 
 class Hardware:
@@ -239,7 +246,10 @@ class UPSController:
         temperature_ok = not cfg.temperature_sensor_type or (temp is not None and 15 <= temp <= 50)
         enabled = sample['charging_enabled']
         # Observe hardware on every iteration, rather than trusting an old command.
-        desired = enabled
+        # Once explicitly authorised, initialise an unknown charging switch
+        # conservatively to disabled in the hysteresis band. Below the resume
+        # threshold normal policy permits charging. Observation never writes it.
+        desired = enabled if enabled is not None else False
         if not warm or not temperature_ok:
             desired = False
         elif capacity >= cfg.max_charge_capacity or (cfg.max_voltage and voltage >= cfg.max_voltage):
@@ -276,7 +286,7 @@ class UPSController:
             self.shutdown_executed = True
 
         return dict(sample, control_charging=cfg.control_charging,
-                    charger_charging=bool(enabled and present),
+                    charger_charging=(None if enabled is None and present else bool(enabled and present)),
                     automatic_shutdown=cfg.automatic_shutdown,
                     fan_control='Raspberry Pi OS', charging_requested=desired,
                     charging_recommendation=charge_reason, warmup_complete=warm,
