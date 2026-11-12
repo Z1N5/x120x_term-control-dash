@@ -15,7 +15,7 @@ import time
 from urllib.request import Request, urlopen
 
 DEFAULT_STATUS = '/run/x120x-ups/status.json'
-DASHBOARD_VERSION = '1.2.0'
+DASHBOARD_VERSION = '1.3.0'
 REPOSITORY_URL = 'https://github.com/Z1N5/x120x_term-control-dash'
 VERSION_URL = 'https://raw.githubusercontent.com/Z1N5/x120x_term-control-dash/main/VERSION'
 SETTINGS_HELPER = '/usr/local/bin/x120x-control'
@@ -496,7 +496,7 @@ def fan_settings_command(curve,is_root=None):
 
 
 def fan_settings_menu(screen):
-    from x120x_fan import FanCurve,proposed_curve
+    from x120x_fan import FanCurve,proposed_curve,FAN_PRESETS
     initial,source=proposed_curve()
     values=list(initial.temperatures)+list(initial.speeds)+[initial.hysteresis[0]]
     fields=[f'Stage {i+1} temperature (C, 30 to 75)' for i in range(4)]+[
@@ -509,11 +509,13 @@ def fan_settings_menu(screen):
             height,width=screen.getmaxyx()
             small=height<10 or width<40
             lines=(['Enlarge terminal for fan settings.','Enter or Esc: cancel'] if small else
-                   ['1  Let Raspberry Pi OS choose its existing curve',
-                    '2  Override with a custom automatic fan curve',
-                    'Both modes keep the OS in charge of cooling.',
-                    'Two confirmations before saving. Reboot required.',
-                    '1 / 2: choose mode    Esc: cancel'] if not mode_selected else
+                   ['1  OS settings - no project override',
+                    '2  Balanced - recommended starting point',
+                    '3  Cooler - earlier, stronger airflow',
+                    '4  Quiet - later, gentler airflow',
+                    '5  Custom - edit temperatures and speeds',
+                    'Select to review; two confirmations before saving.',
+                    'Reboot required. Enter: Balanced    Esc: cancel'] if not mode_selected else
                    [source,f'Field {index+1} of 9: {fields[index]}',
                     f'Value [{values[index]:g}]: '+typed,
                     'Temperatures increase; speeds do not decrease.',
@@ -532,7 +534,11 @@ def fan_settings_menu(screen):
             if not mode_selected:
                 if key==ord('1'):
                     return 'os'
-                if key in (ord('2'),10,13,curses.KEY_ENTER):
+                presets={ord('2'):'balanced',ord('3'):'cooler',ord('4'):'quiet',
+                         10:'balanced',13:'balanced',curses.KEY_ENTER:'balanced'}
+                if key in presets:
+                    return FAN_PRESETS[presets[key]]
+                if key==ord('5'):
                     mode_selected=True
                 continue
             if key in (curses.KEY_BACKSPACE,127,8):

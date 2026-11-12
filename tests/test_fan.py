@@ -137,7 +137,7 @@ class BootWriteTests(unittest.TestCase):
             self.assertIn('active curve unavailable',fan.curve_status(self.config))
         values=fan.FanCurve().parameters()
         with patch.object(fan,'active_parameters',return_value=values):
-            self.assertEqual(fan.curve_status(self.config),'Saved curve is active')
+            self.assertEqual(fan.curve_status(self.config),'Balanced: saved curve is active')
         values['fan_temp0']='45000'
         with patch.object(fan,'active_parameters',return_value=values):
             self.assertIn('not active',fan.curve_status(self.config))
@@ -170,7 +170,7 @@ class FanMenuTests(unittest.TestCase):
 
     def test_custom_curve_wizard_accepts_defaults_without_applying(self):
         with patch.object(fan,'proposed_curve',return_value=(fan.FanCurve(),'Starter curve')):
-            result=dashboard.fan_settings_menu(self.screen([ord('2')]+[10]*9))
+            result=dashboard.fan_settings_menu(self.screen([ord('5')]+[10]*9))
         self.assertEqual(result,fan.FanCurve())
 
     def test_os_control_mode_is_explicit(self):
@@ -180,7 +180,32 @@ class FanMenuTests(unittest.TestCase):
 
     def test_escape_cancels_fan_wizard(self):
         self.assertIsNone(dashboard.fan_settings_menu(self.screen([27])))
-        self.assertIsNone(dashboard.fan_settings_menu(self.screen([ord('2'),27])))
+        self.assertIsNone(dashboard.fan_settings_menu(self.screen([ord('5'),27])))
+
+    def test_presets_select_valid_curves_without_writing(self):
+        for key,name in ((ord('2'),'balanced'),(ord('3'),'cooler'),(ord('4'),'quiet'),(10,'balanced')):
+            with self.subTest(name=name),patch.object(fan,'apply_curve') as apply:
+                curve=dashboard.fan_settings_menu(self.screen([key]))
+                self.assertEqual(curve,fan.FAN_PRESETS[name])
+                curve.validate()
+                self.assertEqual(curve.speeds[-1],100)
+                self.assertLessEqual(curve.temperatures[-1],75)
+                self.assertEqual(curve.hysteresis,(5,5,5,5))
+                apply.assert_not_called()
+
+    def test_saved_preset_is_identified_without_extra_configuration(self):
+        for name,curve in fan.FAN_PRESETS.items():
+            self.assertEqual(fan.curve_name(curve.parameters()),name.capitalize())
+        custom=fan.FanCurve((40,50,60,70))
+        self.assertEqual(fan.curve_name(custom.parameters()),'Custom')
+
+    def test_cooler_and_quiet_are_distinct_from_balanced(self):
+        balanced=fan.FAN_PRESETS['balanced']
+        cooler=fan.FAN_PRESETS['cooler']
+        quiet=fan.FAN_PRESETS['quiet']
+        self.assertLess(cooler.temperatures[0],balanced.temperatures[0])
+        self.assertGreater(quiet.temperatures[0],balanced.temperatures[0])
+        self.assertGreater(cooler.speeds[0],balanced.speeds[0])
 
     def test_custom_curve_uses_fixed_helper_and_validated_arguments(self):
         command=dashboard.fan_settings_command(fan.FanCurve(),is_root=False)

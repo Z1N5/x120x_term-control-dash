@@ -54,6 +54,22 @@ class FanCurve:
                 f'(PWM {self.pwm()[i]}/255); hysteresis {self.hysteresis[i]:g}C' for i in range(4)]
 
 
+# Project presets, not claims about the installed firmware's factory values.
+# Every explicit curve reaches 100% by 75C and uses 5C hysteresis.
+FAN_PRESETS = {
+    'balanced': FanCurve(),
+    'cooler': FanCurve((45.0,55.0,65.0,75.0),(35.0,55.0,75.0,100.0)),
+    'quiet': FanCurve((55.0,62.0,68.0,75.0),(30.0,40.0,65.0,100.0)),
+}
+
+
+def curve_name(parameters):
+    for name,curve in FAN_PRESETS.items():
+        if parameters==curve.parameters():
+            return name.capitalize()
+    return 'Custom'
+
+
 def parse_values(text, repeat=False):
     values = tuple(float(item.strip()) for item in text.split(','))
     return values*4 if repeat and len(values)==1 else values
@@ -154,13 +170,14 @@ def curve_status(path=BOOT_CONFIG,root=Path('/sys')):
         saved=saved_parameters(Path(path).read_text())
         if saved is None:
             return 'OS managed; no project curve saved'
+        name=curve_name(saved)
         active=active_parameters(root)
         if active is None:
-            return 'Saved curve; active curve unavailable (reboot if just saved)'
+            return name+': saved curve; active curve unavailable (reboot if just saved)'
         keys=[f'fan_temp{i}{suffix}' for i in range(4) for suffix in ('','_hyst','_speed')]
         if all(saved.get(key)==active.get(key) for key in keys):
-            return 'Saved curve is active'
-        return 'Saved curve not active; reboot may be required'
+            return name+': saved curve is active'
+        return name+': saved curve not active; reboot may be required'
     except (OSError,ValueError):
         return 'Fan boot settings unavailable'
 
@@ -177,6 +194,7 @@ def apply_curve(curve,ask=input,path=BOOT_CONFIG,model_path='/proc/device-tree/m
         print('This curve is already saved. Reboot if it has not taken effect.')
         return False
     print(f'Save Raspberry Pi OS fan settings to {target}:')
+    print('Profile: '+curve_name(curve.parameters()))
     print('\n'.join(curve.summary()))
     print('The built-in cooling fan will be enabled and remain temperature-controlled by the OS.\n'
           'The project requires full fan speed by 75C or below. CPU thermal protections remain in place.\n'

@@ -439,17 +439,33 @@ From **v1.2.0**, press **s**, then **2** for fan temperature and speed settings.
 The menu supports the **built-in Raspberry Pi 5 fan connector / official Active
 Cooler**. It does not configure a separate GPIO fan or bypass OS thermal control.
 
-Choose a mode:
+From **v1.3.0**, the list offers presets first, then a custom editor:
 
-1. **Let Raspberry Pi OS choose its existing curve**: remove this project's
-   managed fan override. Earlier OS/custom fan settings outside the managed block
-   are retained; this is not a factory reset. Confirm `yes`, then
+1. **OS settings**: remove this project's override and use the existing Raspberry
+   Pi OS configuration. Earlier OS/custom fan settings outside the managed block
+   remain; this is not a factory reset. Confirm `yes`, then
    `RESTORE OS FAN CONTROL`.
-2. **Override with a custom automatic curve**: enter four increasing temperature
-   thresholds in Celsius, four non-decreasing PWM percentages, and a shared
-   step-down hysteresis. Press Enter to accept a displayed proposed value, or Esc
-   to cancel. Review the full curve in the helper, then confirm `yes` and
-   `APPLY FAN CURVE`.
+2. **Balanced** (recommended starting point): close to the starter curve described
+   below, with full output at the highest stage.
+3. **Cooler**: start airflow earlier and use higher duty at the lower stages.
+4. **Quiet**: start the lower stages later and use gentler duty at moderate loads.
+5. **Custom**: edit the four temperatures, four PWM percentages and shared
+   hysteresis individually. Press Enter to retain a proposed field value or Esc
+   to cancel.
+
+| Preset | Stage temperatures (C) | Stage PWM duty (%) | Hysteresis |
+|---|---|---|---|
+| Balanced | 50 / 60 / 67.5 / 75 | 30 / 50 / 70 / 100 | 5C |
+| Cooler | 45 / 55 / 65 / 75 | 35 / 55 / 75 / 100 | 5C |
+| Quiet | 55 / 62 / 68 / 75 | 30 / 40 / 65 / 100 | 5C |
+
+These are project presets, not claims about firmware factory values. The names
+express intended behaviour; actual noise, RPM and temperatures depend on the
+hardware and load. No preset is installed automatically. Enter at the list selects
+Balanced for review. Choosing a preset skips field-by-field editing but still
+shows the complete curve and requires **both** `yes` and `APPLY FAN CURVE` before
+saving. Custom uses the same confirmations. The dashboard identifies a saved
+curve as Balanced, Cooler, Quiet or Custom by its actual parameter values.
 
 Here, **override means a custom automatic curve**, not a fixed manual speed.
 The OS still changes fan output with CPU temperature in both modes. Percentage
