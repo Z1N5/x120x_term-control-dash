@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
@@ -193,6 +194,37 @@ class PolicyTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_hardware_prepares_power_input_only_with_explicit_flag(self):
+        for authorised in (False, True):
+            with self.subTest(authorised=authorised):
+                smbus = Mock()
+                with patch.dict(sys.modules, {'smbus2': smbus}), patch.object(ups, 'command') as command:
+                    hardware = ups.Hardware(ups.Settings(initialise_power_input=authorised))
+                    if authorised:
+                        command.assert_called_once_with(['pinctrl', 'set', '6', 'ip', 'pu'])
+                    else:
+                        command.assert_not_called()
+                    hardware.close()
+                smbus.SMBus.return_value.close.assert_called_once()
+
+    def test_authorised_input_is_prepared_again_after_each_boot(self):
+        smbus = Mock()
+        with patch.dict(sys.modules, {'smbus2': smbus}), patch.object(ups, 'command') as command:
+            for _ in range(2):
+                hardware = ups.Hardware(ups.Settings(initialise_power_input=True))
+                hardware.close()
+            self.assertEqual(command.call_args_list, [
+                unittest.mock.call(['pinctrl', 'set', '6', 'ip', 'pu']),
+                unittest.mock.call(['pinctrl', 'set', '6', 'ip', 'pu'])])
+
+    def test_input_preparation_failure_closes_bus_and_does_not_continue(self):
+        smbus = Mock()
+        with patch.dict(sys.modules, {'smbus2': smbus}), \
+                patch.object(ups, 'command', side_effect=OSError('GPIO unavailable')):
+            with self.assertRaisesRegex(OSError, 'GPIO unavailable'):
+                ups.Hardware(ups.Settings(initialise_power_input=True))
+        smbus.SMBus.return_value.close.assert_called_once()
+
     def test_pi5_unconfigured_charge_pin_is_unknown_not_a_read_failure(self):
         output = ' 6: ip    pu | hi // GPIO6 = input\n16: no    pd | -- // GPIO16 = none\n'
         self.assertEqual(ups.parse_gpio(output), (True, None))
@@ -256,6 +288,7 @@ class DataTests(unittest.TestCase):
         cfg = ups.Settings.load(Path(__file__).resolve().parents[1] / 'x120x_upsd.ini')
         self.assertFalse(cfg.control_charging)
         self.assertFalse(cfg.automatic_shutdown)
+        self.assertFalse(cfg.initialise_power_input)
 
     def test_legacy_config_does_not_silently_enable_actions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +310,40 @@ class ConfirmationTests(unittest.TestCase):
 
     def test_first_confirmation_cancel_leaves_everything_untouched(self):
         self.check_cancel(['no'])
+
+    def test_monitoring_preparation_requires_both_confirmations(self):
+        for answers in (['no'], ['yes', 'no']):
+            apply = Mock()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(control.enable_monitoring(self.path, Mock(side_effect=answers), apply))
+            self.assertEqual(self.path.read_text(), self.original)
+            self.assertEqual(len(list(self.path.parent.iterdir())), 1)
+            apply.assert_not_called()
+
+    def test_confirmed_monitoring_preserves_all_existing_controls(self):
+        self.path.write_text('[general]\ncontrol_charging=true\nautomatic_shutdown=true\n'
+                             'telegram_enabled=true\nac_max_downtime=12\nmax_charge_capacity=85\n')
+        apply = Mock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(control.enable_monitoring(self.path,
+                Mock(side_effect=['yes', 'ENABLE POWER MONITORING']), apply))
+        cfg = ups.Settings.load(self.path)
+        self.assertTrue(cfg.initialise_power_input)
+        self.assertTrue(cfg.control_charging)
+        self.assertTrue(cfg.automatic_shutdown)
+        self.assertTrue(cfg.telegram_enabled)
+        self.assertEqual(cfg.ac_max_downtime, 12)
+        self.assertEqual(cfg.max_charge_capacity, 85)
+        apply.assert_called_once()
+        self.assertEqual(len(list(self.path.parent.glob('*.before-monitoring-*'))), 1)
+
+    def test_control_enable_commands_authorise_input_preparation(self):
+        for action, args, phrase in ((control.enable_charging, (80,), 'ENABLE CHARGING AT 80%'),
+                                     (control.enable_shutdown, (5,), 'ENABLE SHUTDOWN AFTER 5 MINUTES')):
+            self.path.write_text(self.original)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(action(self.path, *args, ask=Mock(side_effect=['yes', phrase])))
+            self.assertTrue(ups.Settings.load(self.path).initialise_power_input)
 
     def test_second_confirmation_cancel_leaves_everything_untouched(self):
         self.check_cancel(['yes', 'yes'])

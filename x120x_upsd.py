@@ -50,6 +50,8 @@ class Settings:
     # No hardware changes or shutdown commands without these explicit opt-ins.
     control_charging: bool = False
     automatic_shutdown: bool = False
+    # Explicitly authorised input preparation, including after GPIO reset on boot.
+    initialise_power_input: bool = False
     # Legacy field accepted, but there is no added grace period after a trigger.
     shutdown_grace_seconds: float = 0
     poll_seconds: float = 2
@@ -161,6 +163,10 @@ class Hardware:
         self.bus = smbus2.SMBus(1)
         self.sensor = None
         try:
+            if settings.initialise_power_input:
+                # Same active-low, pull-up input used by the vendor's Button(6).
+                # No output level is driven and GPIO 16 is untouched here.
+                command(['pinctrl', 'set', '6', 'ip', 'pu'])
             if settings.temperature_sensor_type:
                 import board
                 import adafruit_dht

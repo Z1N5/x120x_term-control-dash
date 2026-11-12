@@ -31,6 +31,7 @@ def enable_charging(path, limit, ask=input, apply_service=None):
     print(f'Configuration: {path}\n'
           f'This will ENABLE automatic battery charging control at {limit}%.\n'
           f'Charging stops at {limit}% and may resume at {limit-3}% (subject to voltage/temperature limits).\n'
+          'GPIO 6 will be prepared as a pull-up INPUT on each service start.\n'
           'It will enable/start or restart x120x_upsd on this Pi.\n'
           f'Automatic shutdown remains {"ON" if shutdown_enabled else "OFF"}. Fan settings will not be changed.')
     if ask('Confirmation 1 of 2 - proceed? Type yes: ').strip().lower() != 'yes':
@@ -39,7 +40,7 @@ def enable_charging(path, limit, ask=input, apply_service=None):
     if ask(f'Confirmation 2 of 2 - type exactly "{phrase}": ').strip() != phrase:
         return False
     return save_settings(path, original, {'control_charging': 'true',
-                         'max_charge_capacity': str(limit)}, 'charging', apply_service)
+                         'max_charge_capacity': str(limit), 'initialise_power_input': 'true'}, 'charging', apply_service)
 
 
 def enable_shutdown(path, minutes, ask=input, apply_service=None):
@@ -63,6 +64,7 @@ def enable_shutdown(path, minutes, ask=input, apply_service=None):
           'or immediately at 20% battery or 3.5V, whichever comes first.\n'
           'There is NO extra grace period. Checks normally run every 2 seconds.\n'
           'The same rules apply when starting the Pi on battery power.\n'
+          'GPIO 6 will be prepared as a pull-up INPUT on each service start.\n'
           'External power returning before a shutdown request clears the outage timer.\n'
           'An OS shutdown already requested cannot be reliably cancelled.\n'
           'Charging control and fan settings will not be changed.\n'
@@ -77,7 +79,26 @@ def enable_shutdown(path, minutes, ask=input, apply_service=None):
         'automatic_shutdown': 'true', 'ac_max_downtime': duration,
         'min_charge_capacity': '20', 'min_voltage': '3.5',
         'no_power_at_start': 'standard', 'disable_self_protect': 'false',
-        'shutdown_grace_seconds': '0'}, 'shutdown', apply_service)
+        'shutdown_grace_seconds': '0', 'initialise_power_input': 'true'}, 'shutdown', apply_service)
+
+
+def enable_monitoring(path, ask=input, apply_service=None):
+    from x120x_upsd import Settings
+    path = Path(path)
+    original = path.read_text()
+    settings = Settings.load(path)
+    print('This will prepare GPIO 6 as a pull-up INPUT on every service start, including after reboot.\n'
+          'GPIO 6 is the UPS external-power sense input. No output level will be driven on it.\n'
+          f'Charging control remains {"ON" if settings.control_charging else "OFF"}; '
+          f'automatic shutdown remains {"ON" if settings.automatic_shutdown else "OFF"}; '
+          f'Telegram remains {"ON" if settings.telegram_enabled else "OFF"}.\n'
+          'The service will be enabled/started or restarted with those existing settings.\n'
+          'Fan, boot and EEPROM settings will not be changed.')
+    if ask('Confirmation 1 of 2 - proceed? Type yes: ').strip().lower() != 'yes':
+        return False
+    if ask('Confirmation 2 of 2 - type exactly "ENABLE POWER MONITORING": ').strip() != 'ENABLE POWER MONITORING':
+        return False
+    return save_settings(path, original, {'initialise_power_input': 'true'}, 'monitoring', apply_service)
 
 
 def save_settings(path, original, changes, action, apply_service):
@@ -124,6 +145,7 @@ def enable_telegram(path, ask=input, read_secret=getpass.getpass, apply_service=
           'The destination is the numeric chat ID you provide; members of that chat can read alerts.\n'
           'Bot credentials stay in a private file on this Pi, not in the repository.\n'
           'Network failures queue messages for retry without delaying UPS monitoring.\n'
+          'GPIO 6 will be prepared as a pull-up INPUT on each service start.\n'
           f'Charging remains {"ON" if settings.control_charging else "OFF"}; '
           f'automatic shutdown remains {"ON" if settings.automatic_shutdown else "OFF"}.\n'
           'This will enable/start or restart the service. No test message is sent by setup.')
@@ -139,7 +161,7 @@ def enable_telegram(path, ask=input, read_secret=getpass.getpass, apply_service=
         if apply_service:
             apply_service()
     return save_settings(path, original, {'telegram_enabled': 'true',
-        'telegram_config_file': str(credentials_path)}, 'telegram', apply)
+        'telegram_config_file': str(credentials_path), 'initialise_power_input': 'true'}, 'telegram', apply)
 
 
 def test_telegram(path, ask=input, sender=None):
@@ -156,6 +178,7 @@ def test_telegram(path, ask=input, sender=None):
 
 def start_service():
     subprocess.run(['systemctl', 'enable', 'x120x_upsd.service'], check=True)
+    subprocess.run(['systemctl', 'reset-failed', 'x120x_upsd.service'], check=True)
     subprocess.run(['systemctl', 'restart', 'x120x_upsd.service'], check=True)
     print('Settings applied. Check x120x-dashboard for live status.')
 
@@ -163,6 +186,7 @@ def start_service():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
+    actions.add_parser('enable-monitoring')
     actions.add_parser('enable-charging').add_argument('--limit', type=int, default=80)
     actions.add_parser('enable-shutdown').add_argument('--minutes', type=float, required=True)
     actions.add_parser('enable-telegram')
@@ -175,7 +199,9 @@ def main():
         parser.error('Run with sudo to edit the installed configuration')
     try:
         path = '/usr/local/etc/x120x_upsd.ini'
-        if args.action == 'enable-charging':
+        if args.action == 'enable-monitoring':
+            completed = enable_monitoring(path, apply_service=start_service)
+        elif args.action == 'enable-charging':
             completed = enable_charging(path, args.limit, apply_service=start_service)
         elif args.action == 'enable-shutdown':
             completed = enable_shutdown(path, args.minutes, apply_service=start_service)

@@ -25,7 +25,8 @@ install -m 644 x120x_upsd.service /etc/systemd/system/x120x_upsd.service
 python3 /usr/local/bin/x120x_upsd.py --check-config
 systemctl daemon-reload
 echo 'Installed. The service has NOT been started or enabled by this installer.'
-echo 'For monitoring only: sudo systemctl enable --now x120x_upsd.service'
+echo 'For double-confirmed power-input preparation and monitoring:'
+echo '  sudo x120x-control enable-monitoring'
 echo 'To enable charging at 80% with two confirmations:'
 echo '  sudo x120x-control enable-charging --limit 80'
 echo 'To enable shutdown with two confirmations and a chosen runtime, for example 5 minutes:'

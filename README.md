@@ -17,7 +17,8 @@ controller. Any number of read-only terminal dashboards can observe it over SSH.
 - Installation copies files only. It does not start or enable the service.
 - The supplied configuration is monitor-only: charging control OFF, automatic
   shutdown OFF. Existing configurations are preserved; missing new control flags
-  default to OFF. Monitoring does not change GPIO configuration or charging.
+  default to OFF. Before explicit input preparation, observation does not change
+  GPIO configuration or charging. The dashboard itself never changes GPIO.
 - The charging-enable command requires TWO confirmations. Only after both does
   it save the charge limit and enable/start or restart the service. It saves a
   backup of the configuration first. Cancelling either prompt changes nothing.
@@ -60,8 +61,31 @@ Do not run both controllers together. If an original script has already
 scheduled an OS shutdown, this version does not cancel that separate request.
 
 I2C must already be enabled, with the UPS fuel gauge at bus 1, address `0x36`.
-This installer does not change those settings. If GPIO 6 isn't already an input,
-the service reports an error rather than silently reconfiguring it.
+This installer does not change I2C, boot or EEPROM settings. Pi 5 GPIOs can return
+to `none` mode on reboot. The power-sense input must therefore be prepared on
+service startup, but only with explicit permission.
+
+### Prepare power monitoring once, including future reboots
+
+```sh
+sudo x120x-control enable-monitoring
+```
+
+Confirm `yes`, then exactly `ENABLE POWER MONITORING`. This saves
+`initialise_power_input=true` and enables/starts or restarts the service.
+On each subsequent service start, GPIO 6 is configured as an input with a pull-up
+(`pinctrl set 6 ip pu`), matching the vendor's power-loss input. No output level is
+driven on GPIO 6. This step does not configure GPIO 16, change fan settings or
+alter charging, shutdown or Telegram enablement; those existing settings are
+preserved and shown in the summary.
+
+The charging, shutdown and Telegram enable commands also disclose and authorise
+this input preparation within their own two-confirmation workflows. Existing
+installations made before this fix should run `enable-monitoring` once after
+updating to save permission without changing their existing policies.
+
+If the pin is not an input and permission is absent, the service refuses to guess
+the power state. Installing the update alone does not grant this permission.
 
 GPIO 16 can initially appear as `no ... | --` (`none`) on Pi 5. Monitor-only mode
 accepts this and displays the charging switch as `Unknown`; it does not configure
@@ -133,10 +157,11 @@ use the helper to apply the new thresholds and clear startup overrides together.
 
 ### Start with observation only instead
 
-Leave both control flags false, then explicitly start the service:
+Leave both charging/shutdown control flags false, then authorise power-input
+preparation and start monitoring with its two confirmations:
 
 ```sh
-sudo systemctl enable --now x120x_upsd.service
+sudo x120x-control enable-monitoring
 x120x-dashboard
 ```
 
