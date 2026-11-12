@@ -229,6 +229,11 @@ def main():
     actions.add_parser('enable-charging').add_argument('--limit', type=int, default=80)
     actions.add_parser('enable-shutdown').add_argument('--minutes', type=float, required=True)
     actions.add_parser('set-shutdown-time').add_argument('--minutes', type=float, required=True)
+    fan_parser=actions.add_parser('set-fan-curve')
+    fan_parser.add_argument('--temperatures',required=True,help='Four comma-separated Celsius thresholds')
+    fan_parser.add_argument('--speeds',required=True,help='Four comma-separated PWM percentages')
+    fan_parser.add_argument('--hysteresis',default='5',help='One or four comma-separated Celsius drops')
+    actions.add_parser('restore-os-fan')
     actions.add_parser('enable-telegram')
     actions.add_parser('test-telegram')
     actions.add_parser('telegram-chat-id')
@@ -249,6 +254,19 @@ def main():
             completed = set_shutdown_time(path, args.minutes, apply_service=restart_service)
             if not completed:
                 print('Cancelled. No settings were changed.')
+                return 2
+        elif args.action == 'set-fan-curve':
+            from x120x_fan import FanCurve,parse_values,apply_curve
+            curve=FanCurve(parse_values(args.temperatures),parse_values(args.speeds),
+                           parse_values(args.hysteresis,repeat=True))
+            completed=apply_curve(curve)
+            if not completed:
+                print('No fan change applied.')
+                return 2
+        elif args.action == 'restore-os-fan':
+            from x120x_fan import restore_os_control
+            completed=restore_os_control()
+            if not completed:
                 return 2
         elif args.action == 'enable-telegram':
             completed = enable_telegram(path, apply_service=start_service)
@@ -275,7 +293,7 @@ def main():
         return 1
     except Exception:
         # Network exceptions must never disclose token-bearing Telegram URLs.
-        print('Telegram operation failed. Check connectivity and private configuration; details withheld.', file=sys.stderr)
+        print('Operation failed. Check installed optional modules, connectivity and configuration; details withheld.', file=sys.stderr)
         return 1
 
 

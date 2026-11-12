@@ -14,6 +14,7 @@ apt-get install -y python3 python3-smbus2 python3-systemd python3-apscheduler ra
 install -d /usr/local/bin /usr/local/etc
 install -m 755 x120x_upsd.py /usr/local/bin/x120x_upsd.py
 install -m 644 x120x_telegram.py /usr/local/bin/x120x_telegram.py
+install -m 644 x120x_fan.py /usr/local/bin/x120x_fan.py
 install -m 755 x120x_dashboard.py /usr/local/bin/x120x-dashboard
 install -m 755 x120x_control.py /usr/local/bin/x120x-control
 if [ ! -e /usr/local/etc/x120x_upsd.ini ]; then

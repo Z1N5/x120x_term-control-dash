@@ -15,7 +15,7 @@ import time
 from urllib.request import Request, urlopen
 
 DEFAULT_STATUS = '/run/x120x-ups/status.json'
-DASHBOARD_VERSION = '1.1.0'
+DASHBOARD_VERSION = '1.2.0'
 REPOSITORY_URL = 'https://github.com/Z1N5/x120x_term-control-dash'
 VERSION_URL = 'https://raw.githubusercontent.com/Z1N5/x120x_term-control-dash/main/VERSION'
 SETTINGS_HELPER = '/usr/local/bin/x120x-control'
@@ -149,6 +149,11 @@ def pi_metrics(root=Path('/sys')):
     result['undervoltage_now'] = None if bits is None else bool(bits & 1)
     result['undervoltage_history'] = None if bits is None else bool(bits & (1 << 16))
     result['throttled_now'] = None if bits is None else bool(bits & (1 << 2))
+    try:
+        from x120x_fan import curve_status
+        result['fan_curve_status']=curve_status(root=root)
+    except ImportError:
+        result['fan_curve_status']='Install x120x_fan.py to view curve settings'
     return result
 
 
@@ -281,6 +286,7 @@ def rows(report, pi, demo=False, runtime_model=None, update_status=None):
         ('Fan speed:         ' + fmt(pi.get('fan_rpm'), ' RPM', 0), 'normal'),
         ('Fan PWM duty:      ' + fmt(pi.get('fan_pwm_percent'), '%', 0), 'normal'),
         ('Fan cooling state: ' + fmt(pi.get('fan_cooling_state'), '', 0) + ' (OS controlled)', 'normal'),
+        ('Fan curve:         ' + pi.get('fan_curve_status','OS managed'), 'normal'),
         ('Undervoltage now:  ' + boolean(pi.get('undervoltage_now'), 'YES', 'No'),
          'bad' if pi.get('undervoltage_now') else 'normal'),
         ('Low voltage since boot: ' + boolean(pi.get('undervoltage_history'), 'YES', 'No'), 'normal'),
@@ -392,11 +398,12 @@ def settings_menu(screen, report, demo=False):
                 lines = ['Demo mode: settings changes are disabled.', 'Enter, q or Esc: return']
             elif not editing:
                 lines = ['1  Change shutdown time',
+                         '2  Fan temperatures and speeds (reboot required)',
                          'Current limit: ' + (f'{current:g} minutes' if current is not None else 'unavailable / disabled'),
                          'Changes the installed UPS service on this Pi.',
                          'Battery cutoffs and other controls are preserved.',
                          'Two confirmations; admin permission may be requested.',
-                         'Enter / 1: edit    q / Esc: return']
+                         'Enter / 1: shutdown time    2: fan    q / Esc: return']
             else:
                 lines = ['New maximum time on battery, in minutes.',
                          'Examples: 5, 30, 120; decimal minutes accepted.',
@@ -417,6 +424,8 @@ def settings_menu(screen, report, demo=False):
                     return None
                 continue
             if not editing:
+                if key==ord('2'):
+                    return 'fan'
                 if key in (10, 13, curses.KEY_ENTER, ord('1')):
                     editing = True
                 continue
@@ -446,6 +455,8 @@ def open_settings(screen, report, demo=False):
         return 'Settings cancelled; no change saved.'
     if minutes is None:
         return 'Settings closed; no change saved.'
+    if minutes=='fan':
+        return open_fan_settings(screen)
     if not Path(SETTINGS_HELPER).is_file():
         return 'Settings helper is missing. Install the updated x120x_control.py first.'
     # Return the terminal to normal for secure sudo and the helper's two prompts.
@@ -469,6 +480,118 @@ def open_settings(screen, report, demo=False):
         curses.reset_prog_mode()
         screen.clearok(True)
         screen.timeout(100)
+
+
+def fan_settings_command(curve,is_root=None):
+    if is_root is None:
+        is_root=os.geteuid()==0
+    if curve=='os':
+        command=[SETTINGS_HELPER,'restore-os-fan']
+    else:
+        curve.validate()
+        command=[SETTINGS_HELPER,'set-fan-curve','--temperatures',','.join(f'{v:g}' for v in curve.temperatures),
+                 '--speeds',','.join(f'{v:g}' for v in curve.speeds),
+                 '--hysteresis',','.join(f'{v:g}' for v in curve.hysteresis)]
+    return command if is_root else ['sudo','--']+command
+
+
+def fan_settings_menu(screen):
+    from x120x_fan import FanCurve,proposed_curve
+    initial,source=proposed_curve()
+    values=list(initial.temperatures)+list(initial.speeds)+[initial.hysteresis[0]]
+    fields=[f'Stage {i+1} temperature (C, 30 to 75)' for i in range(4)]+[
+            f'Stage {i+1} speed (%, 20 to 100)' for i in range(4)]+[
+            'Step-down hysteresis for all stages (C, 1 to 10)']
+    index=0; typed=''; error=''; mode_selected=False
+    screen.timeout(-1)
+    try:
+        while True:
+            height,width=screen.getmaxyx()
+            small=height<10 or width<40
+            lines=(['Enlarge terminal for fan settings.','Enter or Esc: cancel'] if small else
+                   ['1  Let Raspberry Pi OS choose its existing curve',
+                    '2  Override with a custom automatic fan curve',
+                    'Both modes keep the OS in charge of cooling.',
+                    'Two confirmations before saving. Reboot required.',
+                    '1 / 2: choose mode    Esc: cancel'] if not mode_selected else
+                   [source,f'Field {index+1} of 9: {fields[index]}',
+                    f'Value [{values[index]:g}]: '+typed,
+                    'Temperatures increase; speeds do not decrease.',
+                    'Stage 4 must reach 100% by 75C or below.',
+                    error,'Enter: next/review    Esc: cancel'])
+            settings_screen(screen,'OS-managed fan curve - reboot required',lines)
+            key=screen.getch()
+            if key==27:
+                return None
+            if key==curses.KEY_RESIZE:
+                continue
+            if small:
+                if key in (10,13,curses.KEY_ENTER):
+                    return None
+                continue
+            if not mode_selected:
+                if key==ord('1'):
+                    return 'os'
+                if key in (ord('2'),10,13,curses.KEY_ENTER):
+                    mode_selected=True
+                continue
+            if key in (curses.KEY_BACKSPACE,127,8):
+                typed=typed[:-1]; error=''
+            elif key in (10,13,curses.KEY_ENTER):
+                try:
+                    value=float(typed) if typed else values[index]
+                    lower,upper=((30,75) if index<4 else (20,100) if index<8 else (1,10))
+                    if not math.isfinite(value) or not lower<=value<=upper:
+                        raise ValueError(f'Enter a value from {lower} to {upper}.')
+                    if 0<index<4 and value<=values[index-1]:
+                        raise ValueError('Temperature must exceed the previous stage.')
+                    if 4<index<8 and value<values[index-1]:
+                        raise ValueError('Speed must not decrease from the previous stage.')
+                    if index==7 and value!=100:
+                        raise ValueError('The final stage must be 100%.')
+                    values[index]=value
+                    if index<8:
+                        index+=1; typed=''; error=''
+                        continue
+                    curve=FanCurve(tuple(values[:4]),tuple(values[4:8]),(values[8],)*4)
+                    curve.validate()
+                    return curve
+                except ValueError as problem:
+                    error=str(problem)
+                    if index==8:
+                        index=0
+                    typed=''
+            elif 0<=key<128 and chr(key) in '0123456789.-' and len(typed)<16:
+                typed+=chr(key); error=''
+    finally:
+        screen.timeout(100)
+
+
+def open_fan_settings(screen):
+    try:
+        curve=fan_settings_menu(screen)
+    except ImportError:
+        return 'Fan module missing. Install the updated x120x_fan.py first.'
+    except KeyboardInterrupt:
+        return 'Fan settings cancelled; no change saved.'
+    if curve is None:
+        return 'Fan settings closed; no change saved.'
+    if not Path(SETTINGS_HELPER).is_file():
+        return 'Settings helper missing. Install the updated x120x_control.py first.'
+    curses.def_prog_mode(); curses.endwin()
+    try:
+        result=subprocess.run(fan_settings_command(curve),check=False).returncode
+        message=('Fan settings saved; reboot required to apply. No reboot requested.' if result==0 else
+                 'No fan change applied.' if result==2 else 'Fan settings helper failed; review the output.')
+        print('\n'+message,flush=True)
+        input('Press Enter to return to the dashboard...')
+        return message
+    except (KeyboardInterrupt,EOFError):
+        return 'Fan settings interrupted; review saved status if both confirmations completed.'
+    except OSError:
+        return 'Could not start the fan settings helper.'
+    finally:
+        curses.reset_prog_mode(); screen.clearok(True); screen.timeout(100)
 
 
 def display(screen, args):

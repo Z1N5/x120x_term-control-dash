@@ -29,8 +29,9 @@ changes use a separate privileged helper and explicit double confirmation.
 - Charging and automatic shutdown have separate two-confirmation enable commands.
   Enabling or adjusting either preserves the other setting. Shutdown remains OFF
   until its own enable command is confirmed; warnings alone do not shut down.
-- The dashboard settings menu can change the shutdown timeout through the
-  privileged helper, after two confirmations. Fan, boot, EEPROM, USB power-limit
+- The dashboard menu changes shutdown time or the Pi 5 fan curve through a
+  privileged helper, after two confirmations. Fan changes modify only a managed
+  block in the boot configuration and require a reboot. EEPROM, USB power limits
   and power-supply settings are not changed. Use `--view-only` to disable the menu.
 - Explicitly editing `control_charging` in the configuration is a manual override
   of the supplied confirmation workflow. Use the helper for normal enablement.
@@ -432,22 +433,79 @@ not a substitute for keeping these files outside the checkout.
 [Official Telegram bot setup](https://core.telegram.org/bots/tutorial#obtain-your-bot-token)
 · [Bot API](https://core.telegram.org/bots/api#sendmessage)
 
-## Active Cooler settings
+## Active Cooler settings: OS control or a custom curve
 
-Your official Active Cooler already uses OS temperature-based PWM control and
-has a tachometer for RPM. This version observes it; it never overrides its fan
-pins or writes to fan sysfs controls. A separate cell-mounted sensor would be
-needed to measure battery temperature; CPU temperature is not battery temperature.
+From **v1.2.0**, press **s**, then **2** for fan temperature and speed settings.
+The menu supports the **built-in Raspberry Pi 5 fan connector / official Active
+Cooler**. It does not configure a separate GPIO fan or bypass OS thermal control.
 
-Raspberry Pi supports changing the fan curve using `dtparam=fan_temp0` through
-`fan_temp3`, associated `_speed` values (0–255 PWM), and `_hyst` values in
-`/boot/firmware/config.txt`, followed by a reboot. Temperature and hysteresis
-values are in millidegrees Celsius. These settings can be planned separately
-if you want different noise/cooling behaviour. No edits are included or applied.
+Choose a mode:
+
+1. **Let Raspberry Pi OS choose its existing curve**: remove this project's
+   managed fan override. Earlier OS/custom fan settings outside the managed block
+   are retained; this is not a factory reset. Confirm `yes`, then
+   `RESTORE OS FAN CONTROL`.
+2. **Override with a custom automatic curve**: enter four increasing temperature
+   thresholds in Celsius, four non-decreasing PWM percentages, and a shared
+   step-down hysteresis. Press Enter to accept a displayed proposed value, or Esc
+   to cancel. Review the full curve in the helper, then confirm `yes` and
+   `APPLY FAN CURVE`.
+
+Here, **override means a custom automatic curve**, not a fixed manual speed.
+The OS still changes fan output with CPU temperature in both modes. Percentage
+means PWM duty, not a guaranteed RPM percentage. The tachometer displays actual
+RPM separately. With 5C hysteresis, a stage entered at 50C can step down once the
+temperature falls to roughly 45C. The wizard uses saved project values when
+available; otherwise it clearly labels its starter values as proposals, not
+readings of the current OS defaults.
+
+Project validation permits temperatures from 30C to 75C, speeds from 20% to 100%,
+and hysteresis from 1C to 10C. Thresholds must increase, speeds must not decrease,
+and the final stage must be 100% by 75C or below. These are conservative project
+constraints, not claims that firmware accepts no other values. CPU thermal
+protection and OS fan management remain enabled. The helper checks that it is
+running on a Pi 5 before saving a custom curve and refuses known separate GPIO
+fan overlays.
+
+After BOTH confirmations, the helper backs up `/boot/firmware/config.txt` and
+atomically updates only its labelled managed fan block. Earlier boot lines and
+other settings are retained. Saved project values take precedence over earlier
+fan parameters for Pi 5. It uses `[all]` / `[pi5]` filters and ends overlay scope
+before the base fan curve parameters. It does not drive fan GPIO pins directly,
+write fan sysfs controls, restart the UPS service, change UPS/Telegram settings,
+or automatically reboot. Cancelling either confirmation writes nothing.
+
+**A reboot is required.** Save work and run `sudo reboot` when ready. The dashboard
+compares saved curve values with kernel-exposed active trip points and PWM levels
+when available. It reports a mismatch/pending reboot or unavailable active data,
+rather than claiming saved settings are active. After removing an override, the
+helper's reboot notice still applies even though no project curve remains saved.
+A separate sensor attached to the cells would be needed for battery temperature;
+CPU temperature is not battery temperature.
+
+Update an existing installation without stopping UPS monitoring:
+
+```sh
+cd ~/x120x_term-control-dash
+git pull --ff-only
+sudo install -m 644 x120x_fan.py /usr/local/bin/x120x_fan.py
+sudo install -m 755 x120x_control.py /usr/local/bin/x120x-control
+sudo install -m 755 x120x_dashboard.py /usr/local/bin/x120x-dashboard
+x120x-dashboard
+```
+
+Installing these files does not apply a fan curve. Demo and `--view-only` modes
+cannot apply fan changes. Advanced users can use the same confirmed helper:
+
+```sh
+sudo x120x-control set-fan-curve --temperatures 50,60,67.5,75 --speeds 30,50,70,100 --hysteresis 5
+sudo x120x-control restore-os-fan
+```
 
 References:
 - [Official Active Cooler](https://www.raspberrypi.com/products/active-cooler/)
-- [Official fan configuration parameters](https://github.com/raspberrypi/firmware/blob/master/boot/overlays/README)
+- [Official fan parameters](https://github.com/raspberrypi/firmware/blob/master/boot/overlays/README)
+- [Boot configuration and reboot requirement](https://www.raspberrypi.com/documentation/computers/config_txt.html)
 
 ## Official 45W supply and SSD
 
@@ -485,7 +543,8 @@ also handles a hung loop. There are no unmonitored charge/protection threads.
   If the service is stopped, it cannot issue shutdowns while stopped; a later
   restart resumes saved outage time. An updated startup policy is respected.
 - Charging uses the vendor-documented active-low GPIO 16 output. In observation
-  mode it is only read. OS fan control is never overridden.
+  mode it is only read. The UPS controller never drives the fan; the separate
+  double-confirmed fan menu can select an OS-managed boot curve.
 - JSON readers cannot see partial writes. Old, stopped, failed and cross-boot
   reports are clearly marked unverified.
 - Configuration validation rejects invalid thresholds and periods. The legacy
