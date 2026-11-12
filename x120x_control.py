@@ -101,6 +101,39 @@ def enable_monitoring(path, ask=input, apply_service=None):
     return save_settings(path, original, {'initialise_power_input': 'true'}, 'monitoring', apply_service)
 
 
+def set_shutdown_time(path, minutes, ask=input, apply_service=None):
+    """Edit the time only; enabling shutdown is a separate operation."""
+    if not math.isfinite(minutes) or minutes <= 0:
+        raise ValueError('Shutdown time must be a positive, finite number of minutes')
+    from x120x_upsd import Settings
+    path = Path(path)
+    original = path.read_text()
+    settings = Settings.load(path)
+    previous = settings.ac_max_downtime
+    settings.ac_max_downtime = minutes
+    settings.validate()
+    duration = f'{minutes:g}'
+    print(f'Configuration: {path}\n'
+          f'Change maximum time on battery from {previous:g} to {duration} minutes.\n'
+          f'Automatic shutdown remains {"ON" if settings.automatic_shutdown else "OFF"}.\n'
+          f'Battery cutoffs remain {settings.min_charge_capacity:g}% and {settings.min_voltage:g}V '
+          '(0V means voltage cutoff disabled).\n'
+          'Charging, Telegram, fan and startup-policy settings are preserved.\n'
+          'This will restart the installed UPS service; its boot enablement is preserved.\n'
+          'Elapsed outage time is retained. A shorter limit can cause immediate shutdown\n'
+          'if the Pi is already on battery and that time has elapsed.')
+    if not settings.automatic_shutdown:
+        print('The timer will remain inactive until automatic shutdown is separately enabled.')
+    if settings.no_power_at_start != 'standard':
+        print('The existing battery-start policy can bypass the time limit until external power has been seen.')
+    if ask('Confirmation 1 of 2 - save this change? Type yes: ').strip().lower() != 'yes':
+        return False
+    phrase = f'SET SHUTDOWN TIMER TO {duration} MINUTES'
+    if ask(f'Confirmation 2 of 2 - type exactly "{phrase}": ').strip() != phrase:
+        return False
+    return save_settings(path, original, {'ac_max_downtime': duration}, 'shutdown-time', apply_service)
+
+
 def save_settings(path, original, changes, action, apply_service):
     # Abort if a second editor changed anything while the user was confirming.
     if path.read_text() != original:
@@ -183,12 +216,19 @@ def start_service():
     print('Settings applied. Check x120x-dashboard for live status.')
 
 
+def restart_service():
+    subprocess.run(['systemctl', 'reset-failed', 'x120x_upsd.service'], check=True)
+    subprocess.run(['systemctl', 'restart', 'x120x_upsd.service'], check=True)
+    print('Shutdown time saved and service restarted. Boot enablement was preserved.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
     actions.add_parser('enable-monitoring')
     actions.add_parser('enable-charging').add_argument('--limit', type=int, default=80)
     actions.add_parser('enable-shutdown').add_argument('--minutes', type=float, required=True)
+    actions.add_parser('set-shutdown-time').add_argument('--minutes', type=float, required=True)
     actions.add_parser('enable-telegram')
     actions.add_parser('test-telegram')
     actions.add_parser('telegram-chat-id')
@@ -205,6 +245,11 @@ def main():
             completed = enable_charging(path, args.limit, apply_service=start_service)
         elif args.action == 'enable-shutdown':
             completed = enable_shutdown(path, args.minutes, apply_service=start_service)
+        elif args.action == 'set-shutdown-time':
+            completed = set_shutdown_time(path, args.minutes, apply_service=restart_service)
+            if not completed:
+                print('Cancelled. No settings were changed.')
+                return 2
         elif args.action == 'enable-telegram':
             completed = enable_telegram(path, apply_service=start_service)
         elif args.action == 'test-telegram':

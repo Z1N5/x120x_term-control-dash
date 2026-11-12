@@ -15,4 +15,6 @@ python3 -m unittest discover -s tests -v
 Tests must not issue real shutdown commands or change actual GPIO settings.
 Describe hardware/OS versions tested and distinguish simulation from hardware
 validation. Charging and shutdown enablement must retain separate double
-confirmations, and the dashboard must remain read-only.
+confirmations. Merely viewing the dashboard must never change settings; settings
+actions must use the separately privileged helper and both confirmations. Preserve
+view-only and demo modes as non-mutating.

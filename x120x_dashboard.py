@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Read-only X120X terminal dashboard. No GPIO writes or shutdown commands."""
+"""X120X terminal dashboard; settings use a separately privileged, confirmed helper."""
 import argparse
 import curses
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -14,9 +15,10 @@ import time
 from urllib.request import Request, urlopen
 
 DEFAULT_STATUS = '/run/x120x-ups/status.json'
-DASHBOARD_VERSION = '1.0.0'
+DASHBOARD_VERSION = '1.1.0'
 REPOSITORY_URL = 'https://github.com/Z1N5/x120x_term-control-dash'
 VERSION_URL = 'https://raw.githubusercontent.com/Z1N5/x120x_term-control-dash/main/VERSION'
+SETTINGS_HELPER = '/usr/local/bin/x120x-control'
 
 
 def version_tuple(value):
@@ -294,7 +296,7 @@ def rows(report, pi, demo=False, runtime_model=None, update_status=None):
     lines.extend([
         ('Charging control:  ' + boolean(report.get('control_charging'), 'ON', 'OFF - observation only'), 'warn'),
         ('Automatic shutdown:' + ' ' + boolean(report.get('automatic_shutdown'), 'ON', 'OFF'), 'warn'),
-        ('Fan settings:      Raspberry Pi OS managed; dashboard is read-only', 'normal'),
+        ('Fan settings:      Raspberry Pi OS managed', 'normal'),
         ('Telegram alerts:   ' + report.get('telegram_state', 'disabled') +
          ' | queued: ' + str(report.get('telegram_pending', 0)) +
          ' | dropped: ' + str(report.get('telegram_dropped', 0)), 'normal'),
@@ -328,7 +330,7 @@ def rows(report, pi, demo=False, runtime_model=None, update_status=None):
                   ('Based on ArjenR: https://github.com/ArjenR/x120x_upsd', 'normal'),
                   ('Original Suptronics: https://github.com/suptronics/x120x', 'normal'),
                   ('Created by z1n5 | https://zing.co.uk', 'title'),
-                  ('q: quit  r: refresh  u: check updates  arrows/PageUp/PageDown: scroll', 'normal')])
+                  ('q: quit  s: settings  r: refresh  u: updates  arrows/PageUp/PageDown: scroll', 'normal')])
     return lines
 
 
@@ -341,6 +343,132 @@ def demo_data():
             dict(input_voltage=5.102, cpu_volts=.857, cpu_amps=1.563, pmic_watts=2.529,
                  cpu_temp=50.5, fan_rpm=2655, fan_pwm_percent=30, fan_cooling_state=1,
                  undervoltage_now=False, undervoltage_history=False, throttled_now=False))
+
+
+def settings_command(minutes, is_root=None):
+    if not math.isfinite(minutes) or minutes <= 0:
+        raise ValueError('Enter a positive number of minutes')
+    if is_root is None:
+        is_root = os.geteuid() == 0
+    # Fixed helper and action, validated numeric argument. Never a shell command.
+    command = [SETTINGS_HELPER, 'set-shutdown-time', '--minutes', f'{minutes:g}']
+    return command if is_root else ['sudo', '--'] + command
+
+
+def run_settings_helper(minutes, runner=subprocess.run):
+    """Helper alone owns config writes and BOTH confirmations, including with sudo."""
+    return runner(settings_command(minutes), check=False).returncode
+
+
+def settings_screen(screen, title, lines):
+    height, width = screen.getmaxyx()
+    screen.erase()
+    for y, text in enumerate([title, ''] + lines):
+        if y >= height-1 or width < 2:
+            break
+        safe = ''.join(char if char.isprintable() else ' ' for char in text)
+        try:
+            screen.addnstr(y, 0, safe, width-1, curses.A_BOLD if y == 0 else 0)
+        except curses.error:
+            pass
+    screen.refresh()
+
+
+def settings_menu(screen, report, demo=False):
+    """Return a validated time, or None. Merely opening this menu changes nothing."""
+    screen.timeout(-1)
+    editing = False
+    typed = ''
+    error = ''
+    seconds = report.get('outage_limit_seconds')
+    current = seconds/60 if isinstance(seconds, (int, float)) and seconds > 0 else None
+    try:
+        while True:
+            height, width = screen.getmaxyx()
+            too_small = height < 10 or width < 40
+            if too_small:
+                lines = ['Enlarge the terminal for settings.', 'Enter or Esc: return']
+            elif demo:
+                lines = ['Demo mode: settings changes are disabled.', 'Enter, q or Esc: return']
+            elif not editing:
+                lines = ['1  Change shutdown time',
+                         'Current limit: ' + (f'{current:g} minutes' if current is not None else 'unavailable / disabled'),
+                         'Changes the installed UPS service on this Pi.',
+                         'Battery cutoffs and other controls are preserved.',
+                         'Two confirmations; admin permission may be requested.',
+                         'Enter / 1: edit    q / Esc: return']
+            else:
+                lines = ['New maximum time on battery, in minutes.',
+                         'Examples: 5, 30, 120; decimal minutes accepted.',
+                         'No setting changes until BOTH confirmations pass.',
+                         'Minutes: ' + typed, error, 'Enter: review change    Esc: cancel']
+            settings_screen(screen, 'Settings' + (' [DEMO]' if demo else ''), lines)
+            key = screen.getch()
+            if key == curses.KEY_RESIZE:
+                continue
+            if key == 27 or (not editing and key in (ord('q'), ord('Q'))):
+                return None
+            if too_small:
+                if key in (10, 13, curses.KEY_ENTER):
+                    return None
+                continue
+            if demo:
+                if key in (10, 13, curses.KEY_ENTER):
+                    return None
+                continue
+            if not editing:
+                if key in (10, 13, curses.KEY_ENTER, ord('1')):
+                    editing = True
+                continue
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                typed = typed[:-1]
+                error = ''
+            elif key in (10, 13, curses.KEY_ENTER):
+                try:
+                    minutes = float(typed)
+                    settings_command(minutes)  # Shared finite/positive validation.
+                    if current is not None and minutes == current:
+                        return None
+                    return minutes
+                except ValueError:
+                    error = 'Enter a positive number, for example 120.'
+            elif 0 <= key < 128 and chr(key) in '0123456789.eE+-' and len(typed) < 24:
+                typed += chr(key)
+                error = ''
+    finally:
+        screen.timeout(100)
+
+
+def open_settings(screen, report, demo=False):
+    try:
+        minutes = settings_menu(screen, report, demo)
+    except KeyboardInterrupt:
+        return 'Settings cancelled; no change saved.'
+    if minutes is None:
+        return 'Settings closed; no change saved.'
+    if not Path(SETTINGS_HELPER).is_file():
+        return 'Settings helper is missing. Install the updated x120x_control.py first.'
+    # Return the terminal to normal for secure sudo and the helper's two prompts.
+    # The independent UPS service continues monitoring throughout these prompts.
+    curses.def_prog_mode()
+    curses.endwin()
+    try:
+        print('\nDashboard settings: review the change below. Cancel at either confirmation.\n', flush=True)
+        result = run_settings_helper(minutes)
+        message = ('Shutdown time applied; refreshing service status.' if result == 0 else
+                   'Settings cancelled; no change saved.' if result == 2 else
+                   'Settings helper failed; review the output and service status.')
+        print('\n' + message, flush=True)
+        input('Press Enter to return to the dashboard...')
+        return message
+    except (KeyboardInterrupt, EOFError):
+        return 'Settings interrupted; check service status if both confirmations were completed.'
+    except OSError:
+        return 'Could not start settings helper; check that it and sudo are installed.'
+    finally:
+        curses.reset_prog_mode()
+        screen.clearok(True)
+        screen.timeout(100)
 
 
 def display(screen, args):
@@ -365,11 +493,14 @@ def display(screen, args):
     offset = 0
     refresh_at = 0
     content = []
+    settings_notice = ''
     while True:
         args.update_checker.refresh()
         if time.monotonic() >= refresh_at:
             report, pi = demo_data() if args.demo else (read_status(args.status), pi_metrics())
             content = rows(report, pi, args.demo, args.runtime_model, args.update_checker.snapshot())
+            if settings_notice:
+                content.insert(3, (settings_notice, 'warn'))
             refresh_at = time.monotonic() + args.interval
         height, width = screen.getmaxyx()
         offset = min(max(0, offset), max(0, len(content) - max(1, height-1)))
@@ -382,7 +513,7 @@ def display(screen, args):
                 except curses.error:
                     pass
         if height > 1 and width > 1:
-            footer = f'v{DASHBOARD_VERSION} | Read-only | q quit | u updates | scroll {offset+1}/{len(content)}'
+            footer = f'v{DASHBOARD_VERSION} | s settings | q quit | u updates | scroll {offset+1}/{len(content)}'
             try:
                 screen.addnstr(height-1, 0, footer, width-1, curses.A_REVERSE)
             except curses.error:
@@ -395,6 +526,10 @@ def display(screen, args):
             refresh_at = 0
         elif key in (ord('u'), ord('U')):
             args.update_checker.refresh(force=True)
+            refresh_at = 0
+        elif key in (ord('s'), ord('S')):
+            settings_notice = ('Settings disabled in view-only mode.' if args.view_only else
+                               open_settings(screen, report, args.demo))
             refresh_at = 0
         elif key in (curses.KEY_DOWN, ord('j')):
             offset += 1
@@ -412,6 +547,7 @@ def main():
     parser.add_argument('--no-update-check', action='store_true', help='Disable all dashboard GitHub checks')
     parser.add_argument('--check-updates', action='store_true', help='Check the public GitHub version and exit; no hardware access')
     parser.add_argument('--status', default=DEFAULT_STATUS)
+    parser.add_argument('--view-only', action='store_true', help='Disable the settings menu; monitoring only')
     parser.add_argument('--demo', action='store_true', help='Use clearly labelled sample data; no hardware access')
     parser.add_argument('--once', action='store_true', help='Print one plain-text report')
     parser.add_argument('--interval', type=float, default=2)

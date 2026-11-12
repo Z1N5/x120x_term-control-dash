@@ -10,7 +10,8 @@ original [CC BY-SA 4.0 licence](LICENSE).
 This version supports a Pi 5 with a Suptronics/Geekworm X120X UPS, Raspberry Pi
 OS Lite, and the official Active Cooler. No desktop, Qt, web server or pip
 installation is needed for the standard setup. The service is the only hardware
-controller. Any number of read-only terminal dashboards can observe it over SSH.
+controller. Any number of terminal dashboards can observe it over SSH; settings
+changes use a separate privileged helper and explicit double confirmation.
 
 ## Defaults and explicit permissions
 
@@ -28,8 +29,9 @@ controller. Any number of read-only terminal dashboards can observe it over SSH.
 - Charging and automatic shutdown have separate two-confirmation enable commands.
   Enabling or adjusting either preserves the other setting. Shutdown remains OFF
   until its own enable command is confirmed; warnings alone do not shut down.
-- The dashboard has NO settings-changing keys. No fan configuration, boot
-  configuration, EEPROM, USB power limit or power-supply settings are changed.
+- The dashboard settings menu can change the shutdown timeout through the
+  privileged helper, after two confirmations. Fan, boot, EEPROM, USB power-limit
+  and power-supply settings are not changed. Use `--view-only` to disable the menu.
 - Explicitly editing `control_charging` in the configuration is a manual override
   of the supplied confirmation workflow. Use the helper for normal enablement.
 
@@ -116,7 +118,8 @@ x120x-dashboard
 Use `q` to quit, `r` to refresh, and arrows or PageUp/PageDown to scroll. It adapts
 to smaller SSH terminals. Quitting the dashboard leaves the service running.
 On systems that restrict firmware access, `sudo x120x-dashboard` may be needed
-for Pi metrics; the dashboard remains read-only.
+for Pi metrics. Viewing readings never changes settings; the settings menu
+requires its own two confirmations even when running as root.
 
 ### Enable automatic shutdown with your chosen battery runtime
 
@@ -193,6 +196,58 @@ Demo mode uses labelled sample data, without hardware access:
 python3 x120x_dashboard.py --demo
 python3 x120x_dashboard.py --demo --once
 ```
+
+## Settings menu: shutdown time
+
+From **v1.1.0**, press **s** in the dashboard to open settings. Select
+**Change shutdown time** (Enter or 1), enter the new maximum minutes on battery,
+and press Enter. Positive decimal minutes are accepted; Esc cancels. Entering
+the existing value returns without saving or restarting anything.
+
+The dashboard then opens the trusted settings helper in the same terminal. You
+do not type a separate terminal command. A normal user may see the standard sudo
+password prompt; the dashboard does not receive or save that password. Root users
+still have to complete both confirmations:
+
+1. Review the current and proposed time, shutdown enablement and battery cutoffs.
+   Type `yes` at confirmation 1.
+2. Type the exact phrase shown at confirmation 2, for example
+   `SET SHUTDOWN TIMER TO 120 MINUTES`.
+
+Neither cancellation saves a file or restarts the service. After both pass, the
+helper backs up and atomically updates the configuration, then restarts the
+service. Press Enter to return to the live dashboard and verify the new limit.
+If restart fails, review the message: the configuration may already have been
+saved, and the dashboard will show the actual service state.
+
+This action changes **only** the maximum-time setting. Existing battery cutoffs
+(including the usual 20% / 3.5V), charging, Telegram, input-initialisation permission,
+startup policy and boot enablement are preserved. If shutdown is OFF it stays OFF.
+The helper does not enable shutdown or reset other users' customised thresholds.
+The UPS service keeps monitoring while you review the menu and prompts. Elapsed
+outage time is preserved across the subsequent restart: choosing a shorter time
+than has already elapsed on battery can request shutdown immediately.
+
+Demo mode cannot apply settings. Very small terminals must be enlarged before
+editing. To disable all dashboard settings actions, use:
+
+```sh
+x120x-dashboard --view-only
+```
+
+For existing installations, update **both** the dashboard and control helper:
+
+```sh
+cd ~/x120x_term-control-dash
+git pull --ff-only
+sudo install -m 755 x120x_control.py /usr/local/bin/x120x-control
+sudo install -m 755 x120x_dashboard.py /usr/local/bin/x120x-dashboard
+x120x-dashboard
+```
+
+These installation commands do not restart the UPS service. Only a double-confirmed
+settings change restarts it. The control helper also exposes the same action for
+terminal users as `sudo x120x-control set-shutdown-time --minutes 120`.
 
 ## Dashboard version and update checks
 
