@@ -162,6 +162,9 @@ def rows(report, pi, demo=False):
         ('Charging control:  ' + boolean(report.get('control_charging'), 'ON', 'OFF - observation only'), 'warn'),
         ('Automatic shutdown:' + ' ' + boolean(report.get('automatic_shutdown'), 'ON', 'OFF'), 'warn'),
         ('Fan settings:      Raspberry Pi OS managed; dashboard is read-only', 'normal'),
+        ('Telegram alerts:   ' + report.get('telegram_state', 'disabled') +
+         ' | queued: ' + str(report.get('telegram_pending', 0)) +
+         ' | dropped: ' + str(report.get('telegram_dropped', 0)), 'normal'),
     ])
     limit = report.get('outage_limit_seconds')
     lines.append(('Battery runtime limit: ' + (fmt(limit / 60, ' minutes', 2)

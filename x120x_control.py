@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Separate two-confirmation opt-ins for charging and automatic shutdown."""
+"""Separate two-confirmation opt-ins for charging, shutdown and Telegram alerts."""
 import argparse
 import configparser
+import getpass
 import math
 import os
 from pathlib import Path
@@ -112,6 +113,47 @@ def save_settings(path, original, changes, action, apply_service):
     return True
 
 
+def enable_telegram(path, ask=input, read_secret=getpass.getpass, apply_service=None,
+                    credentials_path='/usr/local/etc/x120x-telegram.json'):
+    from x120x_upsd import Settings
+    from x120x_telegram import TelegramCredentials, private_json
+    path = Path(path)
+    original = path.read_text()
+    settings = Settings.load(path)
+    print('This will enable outbound Telegram messages for power loss and restoration.\n'
+          'The destination is the numeric chat ID you provide; members of that chat can read alerts.\n'
+          'Bot credentials stay in a private file on this Pi, not in the repository.\n'
+          'Network failures queue messages for retry without delaying UPS monitoring.\n'
+          f'Charging remains {"ON" if settings.control_charging else "OFF"}; '
+          f'automatic shutdown remains {"ON" if settings.automatic_shutdown else "OFF"}.\n'
+          'This will enable/start or restart the service. No test message is sent by setup.')
+    if ask('Confirmation 1 of 2 - proceed? Type yes: ').strip().lower() != 'yes':
+        return False
+    if ask('Confirmation 2 of 2 - type exactly "ENABLE TELEGRAM ALERTS": ').strip() != 'ENABLE TELEGRAM ALERTS':
+        return False
+    credentials = TelegramCredentials(read_secret('Bot token (hidden): ').strip(),
+                                      read_secret('Destination chat ID (hidden): ').strip())
+    credentials.validate()
+    def apply():
+        private_json(credentials_path, dict(bot_token=credentials.bot_token, chat_id=credentials.chat_id))
+        if apply_service:
+            apply_service()
+    return save_settings(path, original, {'telegram_enabled': 'true',
+        'telegram_config_file': str(credentials_path)}, 'telegram', apply)
+
+
+def test_telegram(path, ask=input, sender=None):
+    from x120x_upsd import Settings
+    from x120x_telegram import TelegramCredentials, send_message
+    credentials = TelegramCredentials.load(Settings.load(path).telegram_config_file)
+    if ask('Send ONE Telegram test message to the configured chat? Type yes: ').strip().lower() != 'yes':
+        return False
+    (send_message if sender is None else sender)(credentials,
+                'Raspberry Pi UPS: Telegram power alerts test. No hardware settings were changed.')
+    print('Telegram test delivered.')
+    return True
+
+
 def start_service():
     subprocess.run(['systemctl', 'enable', 'x120x_upsd.service'], check=True)
     subprocess.run(['systemctl', 'restart', 'x120x_upsd.service'], check=True)
@@ -123,6 +165,9 @@ def main():
     actions = parser.add_subparsers(dest='action', required=True)
     actions.add_parser('enable-charging').add_argument('--limit', type=int, default=80)
     actions.add_parser('enable-shutdown').add_argument('--minutes', type=float, required=True)
+    actions.add_parser('enable-telegram')
+    actions.add_parser('test-telegram')
+    actions.add_parser('telegram-chat-id')
     args = parser.parse_args()
     if not sys.stdin.isatty():
         parser.error('An interactive terminal is required for both confirmations')
@@ -130,9 +175,21 @@ def main():
         parser.error('Run with sudo to edit the installed configuration')
     try:
         path = '/usr/local/etc/x120x_upsd.ini'
-        completed = (enable_charging(path, args.limit, apply_service=start_service)
-                     if args.action == 'enable-charging' else
-                     enable_shutdown(path, args.minutes, apply_service=start_service))
+        if args.action == 'enable-charging':
+            completed = enable_charging(path, args.limit, apply_service=start_service)
+        elif args.action == 'enable-shutdown':
+            completed = enable_shutdown(path, args.minutes, apply_service=start_service)
+        elif args.action == 'enable-telegram':
+            completed = enable_telegram(path, apply_service=start_service)
+        elif args.action == 'test-telegram':
+            completed = test_telegram(path)
+        else:
+            from x120x_telegram import recent_chat_ids
+            token = getpass.getpass('Bot token (hidden; not saved): ').strip()
+            ids = recent_chat_ids(token)
+            print('Recent chat IDs (local display only): ' + (', '.join(ids) if ids else
+                  'None found. Send /start to the bot and retry.'))
+            return 0
         if not completed:
             print('Cancelled. No settings were changed.')
         return 0
@@ -144,6 +201,10 @@ def main():
         return 1
     except (OSError, ValueError, RuntimeError, configparser.Error, subprocess.SubprocessError) as error:
         print(f'Could not complete enablement: {error}', file=sys.stderr)
+        return 1
+    except Exception:
+        # Network exceptions must never disclose token-bearing Telegram URLs.
+        print('Telegram operation failed. Check connectivity and private configuration; details withheld.', file=sys.stderr)
         return 1
 
 

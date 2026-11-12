@@ -57,6 +57,8 @@ class Settings:
     json_report_period: float = 2
     battery_report_schedule: str = '0 * * * *'
     temperature_sensor_type: str = ''
+    telegram_enabled: bool = False
+    telegram_config_file: str = '/usr/local/etc/x120x-telegram.json'
 
     @classmethod
     def load(cls, path):
@@ -106,6 +108,8 @@ class Settings:
         path = Path(self.json_report_file)
         if not path.is_absolute() or path.is_dir():
             raise ValueError('json_report_file must be an absolute filename')
+        if not Path(self.telegram_config_file).is_absolute():
+            raise ValueError('telegram_config_file must be an absolute filename')
         if self.temperature_sensor_type:
             parts = self.temperature_sensor_type.split(',')
             if len(parts) != 3 or parts[0] not in ('DHT11', 'DHT22'):
@@ -340,9 +344,19 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
     report = {}
     boot_id = boot_identity()
     scheduler = None
+    telegram = None
+    telegram_state = 'disabled'
     try:
         previous = restore_state(status_path, boot_id)
         hardware = hardware_factory(settings)
+        if settings.telegram_enabled:
+            try:
+                from x120x_telegram import TelegramCredentials, TelegramNotifier
+                telegram = TelegramNotifier(TelegramCredentials.load(settings.telegram_config_file))
+                telegram.start()
+            except Exception:
+                telegram_state = 'configuration_error'
+                print('Telegram setup failed; UPS monitoring continues. Check private credentials/state permissions.', flush=True)
         controller = UPSController(settings, hardware.set_charging, request_shutdown, previous)
         # Cron reporting stays on the monitored loop, not a second hardware worker.
         if settings.battery_report_schedule:
@@ -358,6 +372,17 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
             report = controller.tick(hardware.read(), now, uptime_minutes)
             report.update(timestamp=time.time(), boot_id=boot_id, health='ok', error=None,
                           report_interval=settings.poll_seconds, schema_version=2)
+            if telegram is not None:
+                try:
+                    telegram.observe(report)
+                    report.update(telegram.status())
+                except Exception:
+                    telegram.close()
+                    telegram = None
+                    telegram_state = 'outbox_error'
+                    print('Telegram outbox failed; UPS monitoring continues.', flush=True)
+            if telegram is None:
+                report['telegram_state'] = telegram_state
             atomic_json(status_path, report)
             for key in ('charger_present', 'charging_enabled', 'shutdown_recommended',
                         'shutdown_initiated'):
@@ -392,6 +417,8 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
                 atomic_json(status_path, dict(report, health='stopped'))
         finally:
             try:
+                if telegram is not None:
+                    telegram.close()
                 if hardware is not None:
                     hardware.close()
             finally:

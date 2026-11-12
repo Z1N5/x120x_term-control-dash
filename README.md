@@ -163,6 +163,89 @@ python3 x120x_dashboard.py --demo
 python3 x120x_dashboard.py --demo --once
 ```
 
+## Optional Telegram power alerts
+
+Telegram alerts are **disabled by default** and outbound-only. They cannot
+receive commands or change charging, shutdown or fan settings. Enabling alerts
+preserves the existing charging and shutdown policies.
+
+1. Create a dedicated bot with [Telegram BotFather](https://t.me/BotFather) using
+   `/newbot`. Keep the token private; never paste it into GitHub, issues or chat.
+2. Open the bot in Telegram and send `/start`. For a group, add the bot and send
+   a command to it there. For a channel, the bot must have permission to post.
+3. To discover recent destination chat IDs without putting a token in your shell
+   history, run on the Pi:
+
+   ```sh
+   sudo x120x-control telegram-chat-id
+   ```
+
+   Enter the token at the hidden prompt. The command queries the bot's recent
+   updates and prints only numeric chat IDs locally. It does not save the token
+   or send a message. Use a dedicated bot without an existing webhook/other
+   polling application; updates may be unavailable otherwise. If several IDs
+   appear, identify the intended destination before enabling alerts.
+4. Configure and enable alerts:
+
+   ```sh
+   sudo x120x-control enable-telegram
+   ```
+
+   Confirm `yes`, then `ENABLE TELEGRAM ALERTS`. Enter the bot token and numeric
+   destination chat ID at the two hidden prompts. Secrets are written only after
+   confirmation, to `/usr/local/etc/x120x-telegram.json`, mode **0600**, owned by
+   the service user (normally root). They are not stored in the public INI file,
+   dashboard status JSON, logs, command-line arguments or Git repository.
+   The service is then enabled/started or restarted. No setup test is sent.
+5. Optionally send one real test message:
+
+   ```sh
+   sudo x120x-control test-telegram
+   ```
+
+   It sends only after a separate `yes` confirmation. All automated test-suite
+   deliveries are mocked; they never contact Telegram.
+
+Messages report **external power lost / running on battery** and **external
+power restored**, with the event time in UTC, battery percentage and voltage.
+Restore notices include outage duration. Notices use the generic label
+`Raspberry Pi UPS`; the machine hostname is not sent. Members of the configured
+chat can read the notices. The signal cannot distinguish a utility outage from
+an unplugged or failed adapter.
+
+Only changes trigger alerts; repeated polls do not spam. The first sample
+establishes a baseline, so a new installation already on battery does not invent
+an outage time or send a false loss event. The last observed power state is saved
+with the outbox to detect changes across service/Pi restarts. It cannot reconstruct
+multiple transitions that happened while the Pi was off.
+
+Delivery runs in a separate bounded worker: no network request is made by the
+UPS monitoring loop. Errors retry with backoff (including Telegram rate limits).
+A private, persistent outbox at `/var/lib/x120x-ups/telegram-outbox.json` retains up
+to 64 notices, oldest first; overflow drops oldest messages and increments the
+visible dropped counter. Its parent directory is mode **0700**, its file is
+**0600**. systemd creates the directory. Foreground use must provide a similarly
+private directory. The dashboard shows delivery state and pending/dropped counts,
+never message contents or credentials. A failed notification setup or worker
+does not stop charging/shutdown protection.
+
+If the router or internet goes down too, messages wait for connectivity and for
+the Pi to be running. Stored messages can be delivered after a reboot, with their
+original event timestamps. Shutdown never waits for message delivery. Delivery is
+best effort: Telegram may accept a message just before a connection fails, so a
+retry can duplicate it. A changed bot token or destination deliberately discards
+that previous recipient's queue instead of replaying private history to a new
+recipient. Disabling alerts leaves the private outbox in place; delete it locally
+if those pending messages should not be sent on re-enablement.
+
+To disable alerts, set `telegram_enabled=false` in the installed configuration
+and restart the service. To rotate credentials or change destination, rerun the
+double-confirmed setup. GitHub secret scanning and ignore rules are safeguards,
+not a substitute for keeping these files outside the checkout.
+
+[Official Telegram bot setup](https://core.telegram.org/bots/tutorial#obtain-your-bot-token)
+· [Bot API](https://core.telegram.org/bots/api#sendmessage)
+
 ## Active Cooler settings
 
 Your official Active Cooler already uses OS temperature-based PWM control and
@@ -284,6 +367,6 @@ outside the checkout, in a separately secured local directory or a private
 repository. A public repository cannot contain a genuinely private subfolder.
 The ignore rules are a convenience, not an access control: forced adds or already
 tracked files can still publish ignored content. Inspect staged changes before
-pushing. GitHub credentials belong in a credential manager; this application
-requires no API keys. Public upstream, licence and documentation links remain
+pushing. GitHub credentials belong in a credential manager. Core UPS monitoring needs no
+API keys; optional Telegram notifications use a separate private bot token. Public upstream, licence and documentation links remain
 for attribution and installation.

@@ -13,6 +13,7 @@ fi
 apt-get install -y python3 python3-smbus2 python3-systemd python3-apscheduler raspi-utils
 install -d /usr/local/bin /usr/local/etc
 install -m 755 x120x_upsd.py /usr/local/bin/x120x_upsd.py
+install -m 644 x120x_telegram.py /usr/local/bin/x120x_telegram.py
 install -m 755 x120x_dashboard.py /usr/local/bin/x120x-dashboard
 install -m 755 x120x_control.py /usr/local/bin/x120x-control
 if [ ! -e /usr/local/etc/x120x_upsd.ini ]; then
@@ -30,3 +31,5 @@ echo '  sudo x120x-control enable-charging --limit 80'
 echo 'To enable shutdown with two confirmations and a chosen runtime, for example 5 minutes:'
 echo '  sudo x120x-control enable-shutdown --minutes 5'
 echo 'To view: x120x-dashboard'
+echo 'Optional Telegram setup (private prompts; never put tokens on the command line):'
+echo '  sudo x120x-control enable-telegram'
