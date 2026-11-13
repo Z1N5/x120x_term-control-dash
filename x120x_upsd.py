@@ -61,6 +61,9 @@ class Settings:
     temperature_sensor_type: str = ''
     telegram_enabled: bool = False
     telegram_config_file: str = '/usr/local/etc/x120x-telegram.json'
+    telegram_heartbeat_enabled: bool = False
+    telegram_heartbeat_hours: float = 24
+    telegram_heartbeat_start: str = '09:00'
 
     @classmethod
     def load(cls, path):
@@ -112,6 +115,12 @@ class Settings:
             raise ValueError('json_report_file must be an absolute filename')
         if not Path(self.telegram_config_file).is_absolute():
             raise ValueError('telegram_config_file must be an absolute filename')
+        hours=self.telegram_heartbeat_hours
+        if (not isinstance(hours,(int,float)) or isinstance(hours,bool) or not math.isfinite(hours)
+                or not 1<=hours<=24 or int(hours)!=hours):
+            raise ValueError('telegram_heartbeat_hours must be a whole number from 1 to 24')
+        if not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]',self.telegram_heartbeat_start):
+            raise ValueError('telegram_heartbeat_start must be HH:MM in local 24-hour time')
         if self.temperature_sensor_type:
             parts = self.temperature_sensor_type.split(',')
             if len(parts) != 3 or parts[0] not in ('DHT11', 'DHT22'):
@@ -368,7 +377,9 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
         if settings.telegram_enabled:
             try:
                 from x120x_telegram import TelegramCredentials, TelegramNotifier
-                telegram = TelegramNotifier(TelegramCredentials.load(settings.telegram_config_file))
+                heartbeat=(dict(hours=settings.telegram_heartbeat_hours,start=settings.telegram_heartbeat_start)
+                           if settings.telegram_heartbeat_enabled else None)
+                telegram = TelegramNotifier(TelegramCredentials.load(settings.telegram_config_file),heartbeat=heartbeat)
                 telegram.start()
             except Exception:
                 telegram_state = 'configuration_error'
@@ -387,7 +398,11 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
             uptime_minutes = minutes_since_boot()
             report = controller.tick(hardware.read(), now, uptime_minutes)
             report.update(timestamp=time.time(), boot_id=boot_id, health='ok', error=None,
-                          report_interval=settings.poll_seconds, schema_version=2)
+                          report_interval=settings.poll_seconds, schema_version=2,
+                          telegram_enabled=settings.telegram_enabled,
+                          telegram_heartbeat_enabled=settings.telegram_heartbeat_enabled,
+                          telegram_heartbeat_hours=settings.telegram_heartbeat_hours,
+                          telegram_heartbeat_start=settings.telegram_heartbeat_start)
             if telegram is not None:
                 try:
                     telegram.observe(report)

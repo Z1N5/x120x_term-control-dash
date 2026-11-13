@@ -3,6 +3,7 @@
 import argparse
 import curses
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import math
 import os
@@ -15,7 +16,7 @@ import time
 from urllib.request import Request, urlopen
 
 DEFAULT_STATUS = '/run/x120x-ups/status.json'
-DASHBOARD_VERSION = '1.3.0'
+DASHBOARD_VERSION = '1.4.0'
 REPOSITORY_URL = 'https://github.com/Z1N5/x120x_term-control-dash'
 VERSION_URL = 'https://raw.githubusercontent.com/Z1N5/x120x_term-control-dash/main/VERSION'
 SETTINGS_HELPER = '/usr/local/bin/x120x-control'
@@ -190,6 +191,15 @@ def boolean(value, yes, no):
     return yes if value is True else no if value is False else 'Unknown'
 
 
+def local_time_text(timestamp):
+    if not isinstance(timestamp,(int,float)) or not math.isfinite(timestamp):
+        return 'Not scheduled / not sent yet'
+    try:
+        return datetime.fromtimestamp(timestamp).astimezone().strftime('%Y-%m-%d %H:%M %Z')
+    except (OSError,OverflowError,ValueError):
+        return 'Unavailable'
+
+
 @dataclass(frozen=True)
 class RuntimeModel:
     # Defaults describe two 3000mAh, 3.7V cells, not measured pack capacity.
@@ -307,6 +317,20 @@ def rows(report, pi, demo=False, runtime_model=None, update_status=None):
          ' | queued: ' + str(report.get('telegram_pending', 0)) +
          ' | dropped: ' + str(report.get('telegram_dropped', 0)), 'normal'),
     ])
+    if 'telegram_heartbeat_enabled' not in report:
+        lines.append(('Telegram heartbeat: Unknown (update the service for this feature)', 'normal'))
+    elif report['telegram_heartbeat_enabled']:
+        interval=report.get('telegram_heartbeat_hours')
+        hours=f'{interval:g}' if isinstance(interval,(int,float)) else '?'
+        lines.append((f'Telegram heartbeat: ON - every {hours}h, first at '+
+                      report.get('telegram_heartbeat_start','?')+' (Pi local time)', 'normal'))
+        lines.append(('Next heartbeat:    '+local_time_text(report.get('telegram_heartbeat_next'))+
+                      ('' if usable else ' (UNVERIFIED)'), 'normal'))
+        lines.append(('Last heartbeat sent: '+local_time_text(report.get('telegram_heartbeat_last_sent')), 'normal'))
+        if report.get('telegram_enabled') is False:
+            lines.append(('Heartbeat paused: Telegram alerts are disabled.', 'warn'))
+    else:
+        lines.append(('Telegram heartbeat: OFF', 'normal'))
     limit = report.get('outage_limit_seconds')
     lines.append(('Shutdown timer limit: ' + (fmt(limit / 60, ' minutes', 2)
                   if isinstance(limit, (int, float)) else 'Disabled / unavailable'), 'normal'))
@@ -345,6 +369,8 @@ def demo_data():
                  current_capacity=80.2, charger_present=True, charging_enabled=False,
                  max_capacity=80, control_charging=True, automatic_shutdown=False,
                  min_capacity=20, min_voltage=3.5, outage_limit_seconds=300,
+                 telegram_enabled=False,telegram_heartbeat_enabled=False,
+                 telegram_heartbeat_hours=24,telegram_heartbeat_start='09:00',
                  battery_temperature=None, shutdown_recommended='', shutdown_initiated=False),
             dict(input_voltage=5.102, cpu_volts=.857, cpu_amps=1.563, pmic_watts=2.529,
                  cpu_temp=50.5, fan_rpm=2655, fan_pwm_percent=30, fan_cooling_state=1,
@@ -391,7 +417,7 @@ def settings_menu(screen, report, demo=False):
     try:
         while True:
             height, width = screen.getmaxyx()
-            too_small = height < 10 or width < 40
+            too_small = height < 12 or width < 40
             if too_small:
                 lines = ['Enlarge the terminal for settings.', 'Enter or Esc: return']
             elif demo:
@@ -399,11 +425,13 @@ def settings_menu(screen, report, demo=False):
             elif not editing:
                 lines = ['1  Change shutdown time',
                          '2  Fan temperatures and speeds (reboot required)',
+                         '3  Telegram heartbeat schedule',
+                         '4  Send Telegram test message',
                          'Current limit: ' + (f'{current:g} minutes' if current is not None else 'unavailable / disabled'),
-                         'Changes the installed UPS service on this Pi.',
+                         'Settings apply to this Pi.',
                          'Battery cutoffs and other controls are preserved.',
                          'Two confirmations; admin permission may be requested.',
-                         'Enter / 1: shutdown time    2: fan    q / Esc: return']
+                         '1: time  2: fan  3: heartbeat  4: test  Esc: return']
             else:
                 lines = ['New maximum time on battery, in minutes.',
                          'Examples: 5, 30, 120; decimal minutes accepted.',
@@ -426,6 +454,10 @@ def settings_menu(screen, report, demo=False):
             if not editing:
                 if key==ord('2'):
                     return 'fan'
+                if key==ord('3'):
+                    return 'heartbeat'
+                if key==ord('4'):
+                    return 'telegram-test'
                 if key in (10, 13, curses.KEY_ENTER, ord('1')):
                     editing = True
                 continue
@@ -457,6 +489,10 @@ def open_settings(screen, report, demo=False):
         return 'Settings closed; no change saved.'
     if minutes=='fan':
         return open_fan_settings(screen)
+    if minutes=='heartbeat':
+        return open_heartbeat_settings(screen,report)
+    if minutes=='telegram-test':
+        return open_telegram_test(screen)
     if not Path(SETTINGS_HELPER).is_file():
         return 'Settings helper is missing. Install the updated x120x_control.py first.'
     # Return the terminal to normal for secure sudo and the helper's two prompts.
@@ -596,6 +632,140 @@ def open_fan_settings(screen):
         return 'Fan settings interrupted; review saved status if both confirmations completed.'
     except OSError:
         return 'Could not start the fan settings helper.'
+    finally:
+        curses.reset_prog_mode(); screen.clearok(True); screen.timeout(100)
+
+
+def heartbeat_settings_command(request,is_root=None):
+    if is_root is None:
+        is_root=os.geteuid()==0
+    command=[SETTINGS_HELPER,'set-telegram-heartbeat']
+    if request=='off':
+        command+=['--disable']
+    else:
+        from x120x_telegram import heartbeat_time,validate_heartbeat_hours
+        hours=validate_heartbeat_hours(request['hours'])
+        start=heartbeat_time(request['start'])
+        command+=['--hours',str(hours),'--start',start]
+    return command if is_root else ['sudo','--']+command
+
+
+def heartbeat_settings_menu(screen,report):
+    from x120x_telegram import heartbeat_time,validate_heartbeat_hours
+    interval=report.get('telegram_heartbeat_hours',24)
+    start=report.get('telegram_heartbeat_start','09:00')
+    try:
+        interval=validate_heartbeat_hours(interval)
+    except ValueError:
+        interval=24
+    try:
+        start=heartbeat_time(start)
+    except ValueError:
+        start='09:00'
+    phase=0; typed=''; error=''
+    screen.timeout(-1)
+    try:
+        while True:
+            height,width=screen.getmaxyx()
+            small=height<10 or width<40
+            if small:
+                lines=['Enlarge the terminal for settings.','Enter or Esc: cancel']
+            elif phase==0:
+                lines=['1  Enable / change heartbeat schedule','2  Disable heartbeat only',
+                       '1 = hourly; 24 = once daily. Pi local time.',
+                       'Power-loss / restoration alerts are preserved.',
+                       'Two confirmations before saving. Esc: cancel']
+            elif phase==1:
+                lines=['Interval: whole hours from 1 to 24.',f'Hours [{interval:g}]: '+typed,
+                       '1 = once per hour; 24 = once per day.',error,'Enter: next    Esc: cancel']
+            else:
+                lines=['First message time: 24-hour Pi local clock.',f'First time [{start}]: '+typed,
+                       'Pi clock now: '+datetime.now().astimezone().strftime('%H:%M %Z'),
+                       'Example: 09:00. If passed, first is tomorrow.',error,'Enter: review    Esc: cancel']
+            settings_screen(screen,'Telegram heartbeat',lines)
+            key=screen.getch()
+            if key==27:
+                return None
+            if key==curses.KEY_RESIZE:
+                continue
+            if small:
+                if key in (10,13,curses.KEY_ENTER):
+                    return None
+                continue
+            if phase==0:
+                if key==ord('2'):
+                    return 'off'
+                if key in (ord('1'),10,13,curses.KEY_ENTER):
+                    phase=1
+                continue
+            if key in (curses.KEY_BACKSPACE,127,8):
+                typed=typed[:-1]; error=''
+            elif key in (10,13,curses.KEY_ENTER):
+                try:
+                    if phase==1:
+                        interval=validate_heartbeat_hours(int(typed) if typed else interval)
+                        phase=2; typed=''; error=''
+                    else:
+                        return dict(hours=interval,start=heartbeat_time(typed if typed else start))
+                except ValueError:
+                    error='Use a whole number 1-24.' if phase==1 else 'Use HH:MM, for example 09:00.'
+            elif 0<=key<128 and chr(key) in ('0123456789' if phase==1 else '0123456789:') and len(typed)<8:
+                typed+=chr(key); error=''
+    finally:
+        screen.timeout(100)
+
+
+def open_heartbeat_settings(screen,report):
+    try:
+        request=heartbeat_settings_menu(screen,report)
+    except ImportError:
+        return 'Telegram module missing; install the updated x120x_telegram.py.'
+    except KeyboardInterrupt:
+        return 'Heartbeat settings cancelled; no change saved.'
+    if request is None:
+        return 'Heartbeat settings closed; no change saved.'
+    if not Path(SETTINGS_HELPER).is_file():
+        return 'Settings helper missing; install the updated x120x_control.py.'
+    curses.def_prog_mode(); curses.endwin()
+    try:
+        result=subprocess.run(heartbeat_settings_command(request),check=False).returncode
+        message=('Heartbeat setting saved; service restarted.' if result==0 else
+                 'Heartbeat change cancelled.' if result==2 else 'Heartbeat setup failed; review the output.')
+        print('\n'+message,flush=True)
+        input('Press Enter to return to the dashboard...')
+        return message
+    except (KeyboardInterrupt,EOFError):
+        return 'Heartbeat settings interrupted; check status if both confirmations completed.'
+    except OSError:
+        return 'Could not start the heartbeat settings helper.'
+    finally:
+        curses.reset_prog_mode(); screen.clearok(True); screen.timeout(100)
+
+
+def telegram_test_command(is_root=None):
+    if is_root is None:
+        is_root=os.geteuid()==0
+    command=[SETTINGS_HELPER,'test-telegram']
+    return command if is_root else ['sudo','--']+command
+
+
+def open_telegram_test(screen):
+    if not Path(SETTINGS_HELPER).is_file():
+        return 'Settings helper missing; install the updated x120x_control.py.'
+    curses.def_prog_mode(); curses.endwin()
+    try:
+        print('\nTelegram test sends ONE message after confirmation. No setting or service will change.\n',flush=True)
+        result=subprocess.run(telegram_test_command(),check=False).returncode
+        message=('Telegram test delivered.' if result==0 else
+                 'Telegram test cancelled; no message sent.' if result==2 else
+                 'Telegram test failed; check connectivity and private configuration.')
+        print('\n'+message,flush=True)
+        input('Press Enter to return to the dashboard...')
+        return message
+    except (KeyboardInterrupt,EOFError):
+        return 'Telegram test interrupted; a confirmed message may already have been sent.'
+    except OSError:
+        return 'Could not start Telegram test helper.'
     finally:
         curses.reset_prog_mode(); screen.clearok(True); screen.timeout(100)
 

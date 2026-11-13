@@ -393,6 +393,77 @@ preserves the existing charging and shutdown policies.
    It sends only after a separate `yes` confirmation. All automated test-suite
    deliveries are mocked; they never contact Telegram.
 
+### Scheduled Telegram heartbeats and an immediate test
+
+From **v1.4.0**, the main screen shows heartbeat enablement, interval, first
+clock time, next scheduled send and last successful heartbeat delivery. It uses
+the same private bot credentials/chat as power alerts, and is **OFF by default**.
+
+Press **s → 3** for the heartbeat menu:
+
+1. Choose **Enable / change heartbeat schedule**.
+2. Enter a whole number **1–24**: 1 is once per hour, 6 is every six hours,
+   and 24 is once per day.
+3. Enter the first-message time as **HH:MM** in 24-hour **Pi local time**.
+   The menu displays the Pi's current clock and timezone. If the time has passed
+   when the schedule is activated, its first occurrence is tomorrow.
+4. Review the action and confirm `yes`, then the exact phrase shown, for example
+   `ENABLE TELEGRAM HEARTBEAT EVERY 6 HOURS AT 09:00`.
+
+The configuration is backed up and saved, then the service restarts. Other UPS,
+fan and Telegram alert settings and service boot enablement are preserved.
+Telegram alerts must already be configured/enabled. Choosing **Disable heartbeat
+only** requires `yes` and `DISABLE TELEGRAM HEARTBEAT`; power alerts continue.
+
+After the first message, intervals 1–23 follow elapsed hours continuously, not a
+clock-time list restarted at midnight. A daily interval of 24 keeps the chosen
+local time across daylight-saving changes. A nonexistent local clock time moves
+forward through the DST gap; a repeated clock time is used once. Future schedules
+and pending messages are saved privately and survive service/Pi restarts. A
+schedule change resets the first occurrence; a restart alone resumes the saved
+schedule. Missed intervals coalesce to one current health sample rather than a
+burst of old messages. Correct system time/timezone is required.
+
+Heartbeat messages report the sample time, external-power/battery state, battery
+percentage/voltage, and charging/shutdown enablement. They confirm that a healthy
+monitoring sample was taken at that time; a delayed delivery is not proof the
+service is still running now. Network delivery stays on the background Telegram
+worker. Power events are selected ahead of queued heartbeats, and a routine
+heartbeat cannot evict a power alert from a full queue. Only the newest queued
+heartbeat is kept during network outages. An already in-flight request cannot be
+recalled when disabling; normal best-effort/duplicate-delivery caveats apply.
+The dashboard never shows bot tokens, chat IDs or message contents.
+
+Press **s → 4** for **Send Telegram test message**. After administrator permission
+if required, confirm `yes` to send exactly one immediate test message, then press
+Enter to return. It does not alter scheduling, restart services, or change any
+hardware/UPS settings. It works without enabling periodic heartbeats. Cancelling
+the test sends nothing. Test-suite deliveries are mocked, not real messages.
+
+Updating from earlier versions requires the service code as well as the UI:
+
+```sh
+cd ~/x120x_term-control-dash
+git pull --ff-only
+sudo systemctl stop x120x_upsd.service
+sudo sh ./install.sh
+sudo systemctl reset-failed x120x_upsd.service
+sudo systemctl start x120x_upsd.service
+x120x-dashboard
+```
+
+The installer preserves the installed configuration and credentials. Update while
+external power is connected. Your existing control settings are used on restart;
+new heartbeat settings remain OFF until explicitly confirmed. No reboot is needed.
+
+For terminal users, the same confirmed actions are available as:
+
+```sh
+sudo x120x-control set-telegram-heartbeat --hours 6 --start 09:00
+sudo x120x-control set-telegram-heartbeat --disable
+sudo x120x-control test-telegram
+```
+
 Messages report **external power lost / running on battery** and **external
 power restored**, with the event time in UTC, battery percentage and voltage.
 Restore notices include outage duration. Notices use the generic label

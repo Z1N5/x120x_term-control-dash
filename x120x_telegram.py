@@ -4,9 +4,10 @@ Credentials and the retry outbox belong outside the source checkout. Only safe
 delivery-state summaries are exposed in the public-readable UPS status report.
 """
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time as clock_time
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
@@ -17,9 +18,86 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, build_opener, HTTPRedirectHandler
+from zoneinfo import ZoneInfo
 
 DEFAULT_CREDENTIALS = '/usr/local/etc/x120x-telegram.json'
 DEFAULT_OUTBOX = '/var/lib/x120x-ups/telegram-outbox.json'
+
+
+def heartbeat_time(value):
+    if not isinstance(value,str) or not re.fullmatch(r'\d{1,2}:\d{2}',value.strip()):
+        raise ValueError('First heartbeat time must be HH:MM in 24-hour local time')
+    try:
+        return datetime.strptime(value.strip(),'%H:%M').strftime('%H:%M')
+    except ValueError:
+        raise ValueError('First heartbeat time must be HH:MM in 24-hour local time') from None
+
+
+def validate_heartbeat_hours(hours):
+    if (not isinstance(hours,(int,float)) or isinstance(hours,bool) or
+            not math.isfinite(hours) or not 1<=hours<=24 or int(hours)!=hours):
+        raise ValueError('Heartbeat interval must be a whole number from 1 to 24 hours')
+    return int(hours)
+
+
+def local_timezone():
+    try:
+        path=Path('/etc/localtime')
+        with path.open('rb') as stream:
+            return ZoneInfo.from_file(stream,key=str(path.resolve()))
+    except (OSError,ValueError):
+        return datetime.now().astimezone().tzinfo
+
+
+class HeartbeatSchedule:
+    def __init__(self,hours,start,zone=None,previous=None):
+        self.hours=validate_heartbeat_hours(hours)
+        self.start=heartbeat_time(start)
+        self.zone=local_timezone() if zone is None else zone
+        self.signature=f'{self.hours}|{self.start}|{self.zone}'
+        self.next_at=None
+        if previous and previous.get('signature')==self.signature:
+            value=previous.get('next_at')
+            if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0:
+                self.next_at=value
+
+    def first_after(self,now,strict=False):
+        local=datetime.fromtimestamp(now,self.zone)
+        hour,minute=map(int,self.start.split(':'))
+        def candidate(day):
+            # Round-trip through UTC: a skipped DST clock time moves forward
+            # through the gap. A repeated time uses its first occurrence only.
+            instant=datetime.combine(day,clock_time(hour,minute),self.zone)
+            return instant.astimezone(timezone.utc).timestamp()
+        result=candidate(local.date())
+        if result<now or (strict and result==now):
+            result=candidate(local.date()+timedelta(days=1))
+        return result
+
+    def due(self,now):
+        if self.next_at is None:
+            self.next_at=self.first_after(now)
+        if now<self.next_at:
+            return False
+        if self.hours==24:
+            # Daily reports keep the requested local clock time across DST.
+            self.next_at=self.first_after(now,strict=True)
+        else:
+            period=self.hours*3600
+            self.next_at+= (math.floor((now-self.next_at)/period)+1)*period
+        return True
+
+    def state(self):
+        return dict(signature=self.signature,next_at=self.next_at)
+
+
+def heartbeat_message(credentials,report,zone):
+    when=datetime.fromtimestamp(report['timestamp'],zone).isoformat(timespec='seconds')
+    power='External power OK' if report['charger_present'] else 'ON BATTERY'
+    return (f'{credentials.label}\nHEARTBEAT - UPS monitoring running\nTime: {when}\n{power}\n'
+            f"Battery: {report['current_capacity']:.1f}% / {report['current_voltage']:.3f}V\n"
+            f"Charging control: {'ON' if report.get('control_charging') else 'OFF'}\n"
+            f"Automatic shutdown: {'ON' if report.get('automatic_shutdown') else 'OFF'}")
 
 
 @dataclass
@@ -142,7 +220,7 @@ def event_message(credentials, report, present, duration=None):
 
 class TelegramNotifier:
     """A bounded, persistent retry queue with no network operations on observe()."""
-    def __init__(self, credentials, outbox=DEFAULT_OUTBOX, sender=send_message):
+    def __init__(self, credentials, outbox=DEFAULT_OUTBOX, sender=send_message, heartbeat=None, zone=None):
         self.credentials = credentials
         self.recipient_digest = hashlib.sha256((credentials.bot_token + '\0' + credentials.chat_id).encode()).hexdigest()
         self.outbox = Path(outbox)
@@ -156,11 +234,21 @@ class TelegramNotifier:
         self.dropped = 0
         self.last_sent = None
         self.thread = None
+        self.heartbeat=None
+        self.heartbeat_saved=None
+        self.last_heartbeat_sent=None
         self.outbox.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         info = self.outbox.parent.stat()
         if info.st_mode & 0o077 or info.st_uid != os.geteuid():
             raise ValueError('Telegram state directory must be private to the service user (0700)')
         self._load()
+        old_signature=self.heartbeat_saved.get('signature') if self.heartbeat_saved else None
+        if heartbeat is not None:
+            self.heartbeat=HeartbeatSchedule(heartbeat['hours'],heartbeat['start'],zone,self.heartbeat_saved)
+        new_signature=self.heartbeat.signature if self.heartbeat else None
+        if old_signature!=new_signature or self.heartbeat is None:
+            self.queue=[item for item in self.queue if item.get('kind')!='heartbeat']
+            self._save()
 
     def _load(self):
         try:
@@ -186,39 +274,60 @@ class TelegramNotifier:
         if not isinstance(self.outage_started_epoch, (int, float)):
             self.outage_started_epoch = None
         self.dropped = int(data.get('dropped', 0))
+        saved=data.get('heartbeat')
+        self.heartbeat_saved=saved if isinstance(saved,dict) else None
+        self.last_heartbeat_sent=data.get('last_heartbeat_sent')
 
     def _save(self):
         private_json(self.outbox, dict(queue=self.queue, previous_present=self.previous_present,
                      outage_started_epoch=self.outage_started_epoch, dropped=self.dropped,
-                     recipient_digest=self.recipient_digest))
+                     recipient_digest=self.recipient_digest,
+                     heartbeat=self.heartbeat.state() if self.heartbeat else None,
+                     last_heartbeat_sent=self.last_heartbeat_sent))
+
+    def _enqueue(self,text,kind='power'):
+        if kind=='heartbeat':
+            # Keep only the most recent scheduled health sample while offline.
+            self.queue=[item for item in self.queue if item.get('kind')!='heartbeat']
+        if len(self.queue)>=64:
+            if kind=='heartbeat':
+                self.dropped+=1
+                return  # A routine heartbeat must not evict a power event.
+            heartbeat=next((i for i,item in enumerate(self.queue) if item.get('kind')=='heartbeat'),None)
+            self.queue.pop(heartbeat if heartbeat is not None else 0)
+            self.dropped+=1
+        self.queue.append(dict(id=str(time.time_ns()),text=text,kind=kind))
+        self.state='pending'
+        self.condition.notify_all()
 
     def observe(self, report):
         present = report['charger_present']
         with self.condition:
+            changed=False
             if self.previous_present is None:
                 # Establish the initial baseline without inventing a power event.
                 self.previous_present = present
                 if not present:
                     self.outage_started_epoch = report['timestamp']
-                self._save()
-                return
-            if present == self.previous_present:
-                return
-            duration = (max(0, report['timestamp'] - self.outage_started_epoch)
+                changed=True
+            elif present != self.previous_present:
+                duration = (max(0, report['timestamp'] - self.outage_started_epoch)
                         if present and self.outage_started_epoch is not None else None)
-            if not present:
-                self.outage_started_epoch = report['timestamp']
-            text = event_message(self.credentials, report, present, duration)
-            if len(self.queue) >= 64:
-                self.queue.pop(0)
-                self.dropped += 1
-            self.queue.append(dict(id=str(time.time_ns()), text=text))
-            self.previous_present = present
-            if present:
-                self.outage_started_epoch = None
-            self._save()
-            self.state = 'pending'
-            self.condition.notify_all()
+                if not present:
+                    self.outage_started_epoch = report['timestamp']
+                self._enqueue(event_message(self.credentials, report, present, duration))
+                self.previous_present = present
+                if present:
+                    self.outage_started_epoch = None
+                changed=True
+            if self.heartbeat:
+                previous_due=self.heartbeat.next_at
+                if self.heartbeat.due(report['timestamp']):
+                    self._enqueue(heartbeat_message(self.credentials,report,self.heartbeat.zone),'heartbeat')
+                    changed=True
+                changed=changed or previous_due!=self.heartbeat.next_at
+            if changed:
+                self._save()
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name='telegram-notifications', daemon=True)
@@ -227,7 +336,9 @@ class TelegramNotifier:
     def status(self):
         with self.condition:
             return dict(telegram_state=self.state, telegram_pending=len(self.queue),
-                        telegram_dropped=self.dropped, telegram_last_sent=self.last_sent)
+                        telegram_dropped=self.dropped, telegram_last_sent=self.last_sent,
+                        telegram_heartbeat_next=self.heartbeat.next_at if self.heartbeat else None,
+                        telegram_heartbeat_last_sent=self.last_heartbeat_sent)
 
     def _run(self):
         backoff = 1
@@ -237,7 +348,7 @@ class TelegramNotifier:
                     if not self.queue:
                         self.condition.wait(timeout=1)
                         continue
-                    item = dict(self.queue[0])
+                    item = dict(next((entry for entry in self.queue if entry.get('kind')!='heartbeat'),self.queue[0]))
                 try:
                     # Critically, no condition lock is held during network access.
                     self.sender(self.credentials, item['text'])
@@ -250,9 +361,10 @@ class TelegramNotifier:
                     backoff = min(60, backoff * 2)
                     continue
                 with self.condition:
-                    if self.queue and self.queue[0]['id'] == item['id']:
-                        self.queue.pop(0)
+                    self.queue=[entry for entry in self.queue if entry['id']!=item['id']]
                     self.last_sent = time.time()
+                    if item.get('kind')=='heartbeat':
+                        self.last_heartbeat_sent=self.last_sent
                     self.state = 'pending' if self.queue else 'sent'
                     self._save()
                 backoff = 1

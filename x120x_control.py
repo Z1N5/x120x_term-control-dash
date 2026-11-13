@@ -2,6 +2,7 @@
 """Separate two-confirmation opt-ins for charging, shutdown and Telegram alerts."""
 import argparse
 import configparser
+from datetime import datetime
 import getpass
 import math
 import os
@@ -209,6 +210,39 @@ def test_telegram(path, ask=input, sender=None):
     return True
 
 
+def set_telegram_heartbeat(path,hours=None,start=None,disable=False,ask=input,apply_service=None):
+    from x120x_upsd import Settings
+    from x120x_telegram import heartbeat_time,validate_heartbeat_hours
+    path=Path(path)
+    original=path.read_text()
+    settings=Settings.load(path)
+    if disable:
+        changes={'telegram_heartbeat_enabled':'false'}
+        phrase='DISABLE TELEGRAM HEARTBEAT'
+        print('Disable scheduled Telegram heartbeats. Power-loss/restoration alerts remain unchanged.\n'
+              'Other UPS/fan settings and Telegram credentials are preserved. The service will restart.')
+    else:
+        hours=validate_heartbeat_hours(hours)
+        start=heartbeat_time(start)
+        if not settings.telegram_enabled:
+            raise ValueError('Set up and enable Telegram alerts before enabling a heartbeat')
+        changes={'telegram_heartbeat_enabled':'true','telegram_heartbeat_hours':str(hours),
+                 'telegram_heartbeat_start':start}
+        phrase=f'ENABLE TELEGRAM HEARTBEAT EVERY {hours} HOURS AT {start}'
+        print(f'Enable a Telegram heartbeat every {hours} hours, first at the next {start} in Pi local time.\n'
+              'If that clock time has passed when activated, the first message is tomorrow.\n'
+              '24 means once daily at that local time, including daylight-saving changes.\n'
+              'For 1-23, intervals are elapsed hours after the first message.\n'
+              'Messages report power state, battery readings and enabled controls to your configured chat.\n'
+              'Power alerts, charging, shutdown and fan settings are preserved. The service will restart.')
+        print('Pi local time now: '+datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z'))
+    if ask('Confirmation 1 of 2 - save this heartbeat setting? Type yes: ').strip().lower()!='yes':
+        return False
+    if ask(f'Confirmation 2 of 2 - type exactly "{phrase}": ').strip()!=phrase:
+        return False
+    return save_settings(path,original,changes,'telegram-heartbeat',apply_service)
+
+
 def start_service():
     subprocess.run(['systemctl', 'enable', 'x120x_upsd.service'], check=True)
     subprocess.run(['systemctl', 'reset-failed', 'x120x_upsd.service'], check=True)
@@ -219,7 +253,7 @@ def start_service():
 def restart_service():
     subprocess.run(['systemctl', 'reset-failed', 'x120x_upsd.service'], check=True)
     subprocess.run(['systemctl', 'restart', 'x120x_upsd.service'], check=True)
-    print('Shutdown time saved and service restarted. Boot enablement was preserved.')
+    print('Settings saved and service restarted. Boot enablement was preserved.')
 
 
 def main():
@@ -237,6 +271,10 @@ def main():
     actions.add_parser('enable-telegram')
     actions.add_parser('test-telegram')
     actions.add_parser('telegram-chat-id')
+    heartbeat_parser=actions.add_parser('set-telegram-heartbeat')
+    heartbeat_parser.add_argument('--hours',type=int)
+    heartbeat_parser.add_argument('--start',help='First heartbeat HH:MM in Pi local time')
+    heartbeat_parser.add_argument('--disable',action='store_true')
     args = parser.parse_args()
     if not sys.stdin.isatty():
         parser.error('An interactive terminal is required for both confirmations')
@@ -272,6 +310,16 @@ def main():
             completed = enable_telegram(path, apply_service=start_service)
         elif args.action == 'test-telegram':
             completed = test_telegram(path)
+            if not completed:
+                print('Telegram test cancelled. No message sent.')
+                return 2
+        elif args.action == 'set-telegram-heartbeat':
+            if not args.disable and (args.hours is None or args.start is None):
+                parser.error('--hours and --start are required when enabling a heartbeat')
+            completed=set_telegram_heartbeat(path,args.hours,args.start,args.disable,apply_service=restart_service)
+            if not completed:
+                print('Cancelled. No heartbeat setting changed.')
+                return 2
         else:
             from x120x_telegram import recent_chat_ids
             token = getpass.getpass('Bot token (hidden; not saved): ').strip()
