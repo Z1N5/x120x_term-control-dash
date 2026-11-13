@@ -16,7 +16,7 @@ import time
 from urllib.request import Request, urlopen
 
 DEFAULT_STATUS = '/run/x120x-ups/status.json'
-DASHBOARD_VERSION = '1.4.0'
+DASHBOARD_VERSION = '1.5.0'
 REPOSITORY_URL = 'https://github.com/Z1N5/x120x_term-control-dash'
 VERSION_URL = 'https://raw.githubusercontent.com/Z1N5/x120x_term-control-dash/main/VERSION'
 SETTINGS_HELPER = '/usr/local/bin/x120x-control'
@@ -248,6 +248,50 @@ def runtime_text(hours):
     return '~' + duration
 
 
+def battery_performance_rows(report, usable):
+    lines = [('', 'normal'), ('--- BATTERY HEALTH / BACKUP PERFORMANCE ---', 'title'),
+             ('Battery health %: Not measurable with this UPS gauge.', 'normal')]
+    data = report.get('battery_performance')
+    if not isinstance(data, dict):
+        lines.append(('Passive monitoring: Unavailable (update the service).', 'warn'))
+    elif not usable:
+        lines.append(('Passive monitoring: UNVERIFIED (service data unavailable/stale).', 'warn'))
+    elif data.get('state') in ('unavailable', 'storage_error'):
+        lines.append(('Passive monitoring: Unavailable (check service log / history storage).', 'warn'))
+    else:
+        descriptions = dict(learning='Learning - insufficient comparable history',
+                            shorter='Shorter backup performance - possible decline or higher load',
+                            longer='Longer backup performance - load/conditions may have changed',
+                            similar='Similar backup performance to recorded baseline')
+        trend = data.get('trend', 'learning')
+        if trend == 'learning' and data.get('learning_reason') == 'different_range':
+            descriptions['learning'] = 'Learning - latest run uses a different charge range'
+        lines.append(('Performance trend: ' + descriptions.get(trend, descriptions['learning']),
+                      'warn' if trend == 'shorter' else 'normal'))
+        lines.append((f"Recorded runs: {data.get('sessions', 0)} | baseline: "
+                      f"{data.get('baseline_runs', 0)}/3 | recent comparable: "
+                      f"{data.get('comparison_runs', 0)}/3", 'normal'))
+        if data.get('reference_start') is not None:
+            lines.append(('Reference charge range: ' + fmt(data.get('reference_start'), '%', 1) +
+                          ' to ' + fmt(data.get('reference_end'), '%', 1) +
+                          ' (start/end each within 5 percentage points)', 'normal'))
+        last = data.get('last_run')
+        if isinstance(last, dict):
+            seconds = last.get('seconds')
+            lines.append(('Last recorded run: ' + fmt(seconds / 60 if isinstance(seconds, (int, float))
+                          else None, ' min', 1) + ' | ' + fmt(last.get('start'), '%', 1) +
+                          ' to ' + fmt(last.get('end'), '%', 1), 'normal'))
+            lines.append(('Run ended: ' + local_time_text(last.get('ended_at')), 'normal'))
+        if data.get('state') == 'collecting':
+            seconds = data.get('current_seconds', 0)
+            lines.append(('Current battery run: ' + fmt(seconds / 60, ' min', 1) + ' | drop ' +
+                          fmt(data.get('current_drop'), ' percentage points', 1), 'normal'))
+        lines.append(('Qualifying run: at least 15 min and 10 percentage points consumed.', 'normal'))
+    lines.extend([('Trend only; workload, temperature and gauge accuracy affect results.', 'normal'),
+                  ('No automatic tests; charging and shutdown settings are unchanged.', 'normal')])
+    return lines
+
+
 def rows(report, pi, demo=False, runtime_model=None, update_status=None):
     """Text plus semantic colour; shared by curses and --once."""
     lines = [('X120X UPS / RASPBERRY PI 5' + (' [DEMO]' if demo else ''), 'title')]
@@ -266,7 +310,7 @@ def rows(report, pi, demo=False, runtime_model=None, update_status=None):
         lines.append((f"Last sample: {report['age_seconds']:.0f}s ago", 'normal'))
     lines.extend([('', 'normal'), ('--- X120X UPS ---', 'title'),
                   ('UPS voltage:       ' + fmt(report.get('current_voltage'), ' V'), 'normal'),
-                  ('Battery:           ' + fmt(report.get('current_capacity'), '%', 1), 'normal')])
+        ('Battery charge:    ' + fmt(report.get('current_capacity'), '%', 1), 'normal')])
     capacity = report.get('current_capacity')
     if isinstance(capacity, (int, float)) and math.isfinite(capacity):
         filled = round(min(100, max(0, capacity)) / 100 * 26)
@@ -285,8 +329,11 @@ def rows(report, pi, demo=False, runtime_model=None, update_status=None):
     ])
     lines.extend([
         ('Charging switch:   ' + boolean(report.get('charging_enabled'), 'ENABLED', 'DISABLED'), 'normal'),
-        ('Charge limit:      ' + fmt(report.get('max_capacity'), '%', 0) + ' (configured)', 'normal'),
+        ('Charge target:     ' + fmt(report.get('max_capacity'), '%', 0) + ' (configured)', 'normal'),
         ('Battery temp:      ' + fmt(report.get('battery_temperature'), ' C', 1), 'normal'),
+    ])
+    lines.extend(battery_performance_rows(report, usable))
+    lines.extend([
         ('', 'normal'), ('--- RPi5 / ACTIVE COOLER ---', 'title'),
         ('Input voltage:     ' + fmt(pi.get('input_voltage'), ' V'), 'normal'),
         ('CPU volts:         ' + fmt(pi.get('cpu_volts'), ' V'), 'normal'),
@@ -371,6 +418,8 @@ def demo_data():
                  min_capacity=20, min_voltage=3.5, outage_limit_seconds=300,
                  telegram_enabled=False,telegram_heartbeat_enabled=False,
                  telegram_heartbeat_hours=24,telegram_heartbeat_start='09:00',
+                 battery_performance=dict(state='idle', trend='learning', sessions=0,
+                                          baseline_runs=0, comparison_runs=0),
                  battery_temperature=None, shutdown_recommended='', shutdown_initiated=False),
             dict(input_voltage=5.102, cpu_volts=.857, cpu_amps=1.563, pmic_watts=2.529,
                  cpu_temp=50.5, fan_rpm=2655, fan_pwm_percent=30, fan_cooling_state=1,
@@ -427,11 +476,11 @@ def settings_menu(screen, report, demo=False):
                          '2  Fan temperatures and speeds (reboot required)',
                          '3  Telegram heartbeat schedule',
                          '4  Send Telegram test message',
+                         '5  Battery charge target',
                          'Current limit: ' + (f'{current:g} minutes' if current is not None else 'unavailable / disabled'),
-                         'Settings apply to this Pi.',
                          'Battery cutoffs and other controls are preserved.',
                          'Two confirmations; admin permission may be requested.',
-                         '1: time  2: fan  3: heartbeat  4: test  Esc: return']
+                         '1: timer  2: fan  3: heartbeat  4: test  5: charge  Esc: back']
             else:
                 lines = ['New maximum time on battery, in minutes.',
                          'Examples: 5, 30, 120; decimal minutes accepted.',
@@ -458,6 +507,8 @@ def settings_menu(screen, report, demo=False):
                     return 'heartbeat'
                 if key==ord('4'):
                     return 'telegram-test'
+                if key==ord('5'):
+                    return 'charge-target'
                 if key in (10, 13, curses.KEY_ENTER, ord('1')):
                     editing = True
                 continue
@@ -493,6 +544,8 @@ def open_settings(screen, report, demo=False):
         return open_heartbeat_settings(screen,report)
     if minutes=='telegram-test':
         return open_telegram_test(screen)
+    if minutes=='charge-target':
+        return open_charge_target(screen, report)
     if not Path(SETTINGS_HELPER).is_file():
         return 'Settings helper is missing. Install the updated x120x_control.py first.'
     # Return the terminal to normal for secure sudo and the helper's two prompts.
@@ -512,6 +565,98 @@ def open_settings(screen, report, demo=False):
         return 'Settings interrupted; check service status if both confirmations were completed.'
     except OSError:
         return 'Could not start settings helper; check that it and sudo are installed.'
+    finally:
+        curses.reset_prog_mode()
+        screen.clearok(True)
+        screen.timeout(100)
+
+
+def charge_target_command(limit, is_root=None):
+    if (not isinstance(limit, (int, float)) or isinstance(limit, bool) or
+            not math.isfinite(limit) or not 50 <= limit <= 100 or int(limit) != limit):
+        raise ValueError('Enter a whole percentage from 50 to 100')
+    if is_root is None:
+        is_root = os.geteuid() == 0
+    command = [SETTINGS_HELPER, 'set-charge-target', '--limit', str(int(limit))]
+    return command if is_root else ['sudo', '--'] + command
+
+
+def charge_target_menu(screen, report):
+    custom = False
+    typed = ''
+    error = ''
+    current = report.get('max_capacity')
+    screen.timeout(-1)
+    try:
+        while True:
+            height, width = screen.getmaxyx()
+            small = height < 12 or width < 40
+            lines = (['Enlarge terminal for charge settings.', 'Enter or Esc: cancel'] if small else
+                     ['1  80%', '2  85%', '3  90%', '4  100%', '5  Custom (50-100%)',
+                      'Current target: ' + fmt(current, '%', 0) + ' | control ' +
+                      boolean(report.get('control_charging'), 'ON', 'OFF'),
+                      'Two confirmations before saving; control ON/OFF is preserved.',
+                      'Select a target to review. Esc: cancel'] if not custom else
+                     ['New charge target: whole percent, 50-100.', 'Target (%): ' + typed,
+                      'Control ON/OFF and shutdown settings are preserved.',
+                      'No change until BOTH confirmations pass.', error,
+                      'Enter: review    Esc: cancel'])
+            settings_screen(screen, 'Battery charge target', lines)
+            key = screen.getch()
+            if key == 27:
+                return None
+            if key == curses.KEY_RESIZE:
+                continue
+            if small:
+                if key in (10, 13, curses.KEY_ENTER):
+                    return None
+                continue
+            if not custom:
+                if key == ord('5'):
+                    custom = True
+                elif key in (ord('1'), ord('2'), ord('3'), ord('4')):
+                    target = {ord('1'): 80, ord('2'): 85, ord('3'): 90, ord('4'): 100}[key]
+                    return None if target == current else target
+                continue
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                typed = typed[:-1]
+                error = ''
+            elif key in (10, 13, curses.KEY_ENTER):
+                try:
+                    target = int(typed)
+                    charge_target_command(target)
+                    return None if target == current else target
+                except ValueError:
+                    error = 'Enter a whole percentage from 50 to 100.'
+            elif 0 <= key < 128 and chr(key).isdigit() and len(typed) < 3:
+                typed += chr(key)
+    finally:
+        screen.timeout(100)
+
+
+def open_charge_target(screen, report):
+    try:
+        target = charge_target_menu(screen, report)
+    except KeyboardInterrupt:
+        return 'Charge target cancelled; no change saved.'
+    if target is None:
+        return 'Charge settings closed; no change saved.'
+    if not Path(SETTINGS_HELPER).is_file():
+        return 'Settings helper missing; install the updated x120x_control.py.'
+    curses.def_prog_mode()
+    curses.endwin()
+    try:
+        result = subprocess.run(charge_target_command(target), check=False).returncode
+        message = ('Charge target saved; refreshing service status.' if result == 0 else
+                   'Charge target cancelled; no change saved.' if result == 2 else
+                   'Charge target update failed; review output and service status.')
+        print('\n' + message, flush=True)
+        input('Press Enter to return to the dashboard...')
+        return message
+    except (KeyboardInterrupt, EOFError):
+        return 'Charge settings interrupted; check status if both confirmations completed.'
+    except OSError:
+        return 'Could not start the charge settings helper.'
     finally:
         curses.reset_prog_mode()
         screen.clearok(True)

@@ -29,12 +29,116 @@ changes use a separate privileged helper and explicit double confirmation.
 - Charging and automatic shutdown have separate two-confirmation enable commands.
   Enabling or adjusting either preserves the other setting. Shutdown remains OFF
   until its own enable command is confirmed; warnings alone do not shut down.
-- The dashboard menu changes shutdown time or the Pi 5 fan curve through a
+- The dashboard menu changes charge target, shutdown time or the Pi 5 fan curve through a
   privileged helper, after two confirmations. Fan changes modify only a managed
   block in the boot configuration and require a reboot. EEPROM, USB power limits
   and power-supply settings are not changed. Use `--view-only` to disable the menu.
 - Explicitly editing `control_charging` in the configuration is a manual override
   of the supplied confirmation workflow. Use the helper for normal enablement.
+
+## Choose the saved battery charge target (v1.5.0)
+
+Press **s → 5 (Battery charge target)**. Choose **80%, 85%, 90%, 100%** or
+**Custom** (a whole percentage from 50 to 100). The current saved target is shown;
+opening the menu or cancelling does not change it. Selecting the current target
+returns without a restart. The shipped default remains 80%; existing installations
+keep their configured value until the user changes it.
+
+The privileged helper displays the old/new target and charging-control state,
+then requires both `yes` and the exact phrase, for example:
+
+```text
+SET CHARGE TARGET TO 100%
+```
+
+Only the saved target changes. Charging control remains ON or OFF as before;
+saving 100% does **not** implicitly enable it. Shutdown time, low-battery cutoffs,
+Telegram, heartbeat, fan and GPIO input permissions are preserved. A backup is
+saved before the UPS service restarts; boot enablement and elapsed outage time
+are preserved. If charging control is already ON, the new target can immediately
+change whether charging is permitted. A lower target does not actively discharge
+the pack. Charging may resume three percentage points below the target, so a
+100% target uses a 97% resume point. Existing voltage/temperature limits continue
+to apply, and gauge accuracy means that a displayed target is not a precise
+physical limit or a guarantee that the pack will reach it.
+
+The same double-confirmed change is available from a terminal:
+
+```sh
+sudo x120x-control set-charge-target --limit 100
+```
+
+Install v1.5.0 using the update steps below to add both this menu and its helper.
+
+## Passive battery health / backup performance (v1.5.0)
+
+The dashboard separates **battery charge**, **estimated battery runtime**, the
+**shutdown timer**, and **observed backup performance**. The X120X gauge does not
+provide measured full-charge capacity or a battery state-of-health percentage.
+The new section therefore says `Battery health %: Not measurable with this UPS
+gauge` and reports a performance trend instead. It cannot diagnose an individual
+cell or certify that the batteries are healthy.
+
+Passive recording starts with the monitoring service. It uses normal battery
+readings only: there are no automatic discharge tests, GPIO writes, network calls,
+configuration changes or changes to charging/shutdown decisions. It does not
+adjust the existing runtime estimate or extend the shutdown timer.
+
+- A recorded run must contain at least **15 minutes** of continuously observed
+  battery use and a drop of at least **10 percentage points**. A run ends when
+  external power returns or the service stops cleanly. The final battery sample
+  is used; readings after charging resumes are excluded.
+- Sampling gaps longer than the greater of 60 seconds or three polling intervals,
+  reversed/duplicate monitoring times, invalid readings, charge rebounds above
+  two percentage points and single-sample drops above five points discard the
+  active segment. Recording can begin again with fresh valid readings. Small
+  rebounds are ignored rather than counted as extra capacity.
+- The **first three comparable runs** form a fixed baseline. Their starting and
+  ending charge must each be within five percentage points of the first run.
+  The comparison uses the **latest three later runs** within that same range.
+  Other qualifying runs remain in the history but do not affect that comparison.
+  If the latest recorded run uses a different range (for example after changing
+  the charge target), the display returns to Learning instead of reusing an old
+  positive trend for that different range. The original baseline stays intact.
+- Until all six observations exist, the trend says **Learning**. It compares
+  median observed minutes per percentage point: under 80% of baseline is labelled
+  **Shorter backup performance - possible decline or higher load**; above 125%
+  is **Longer backup performance**; otherwise it is **Similar backup performance**.
+  These are conservative display heuristics, not measured health percentages.
+  CPU/SSD workload, temperature, gauge accuracy and battery ageing all affect them.
+
+The main screen shows recorded-run counts, baseline/comparison progress, the
+reference charge range, the last recorded run and the current battery-run progress.
+Do not deliberately drain the batteries just to populate this section. The
+existing low-battery cutoffs and timer continue to apply throughout normal outages.
+
+History is saved only when a qualifying run ends, in
+`/var/lib/x120x-ups/battery-performance.json` (0600, inside the private 0700 service
+state directory). It holds at most 60 recent run summaries plus the fixed baseline;
+no bot keys, chat IDs or hostnames are stored. Completed records survive reboot.
+An unfinished segment is lost after an abrupt stop; different boots are never
+joined into a fictional continuous run. An orderly shutdown can save a qualifying
+segment. Storage errors disable this optional recording and are logged without
+stopping UPS protection. Corrupt history is preserved for inspection instead of
+silently replaced. After replacing batteries, archive/reset this history with the
+service stopped so the new cells do not inherit the old baseline.
+
+For an existing installation, keep external power connected and quit the dashboard
+with `q`, then update both the service and dashboard:
+
+```sh
+cd ~/x120x_term-control-dash
+git pull --ff-only
+sudo systemctl stop x120x_upsd.service
+sudo sh ./install.sh
+sudo systemctl reset-failed x120x_upsd.service
+sudo systemctl start x120x_upsd.service
+x120x-dashboard
+```
+
+Existing configuration, charging/shutdown permissions, Telegram credentials and
+fan settings are preserved. No reboot or additional confirmation is required
+for passive recording; changes to controls still use their existing confirmations.
 
 ## Install on your Pi
 

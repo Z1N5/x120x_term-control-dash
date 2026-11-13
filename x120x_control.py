@@ -135,6 +135,39 @@ def set_shutdown_time(path, minutes, ask=input, apply_service=None):
     return save_settings(path, original, {'ac_max_downtime': duration}, 'shutdown-time', apply_service)
 
 
+def set_charge_target(path, limit, ask=input, apply_service=None):
+    """Change the saved target only; never implicitly enable charging control."""
+    if (not isinstance(limit, (int, float)) or isinstance(limit, bool) or
+            not math.isfinite(limit) or not 50 <= limit <= 100 or int(limit) != limit):
+        raise ValueError('Charge target must be a whole percentage from 50 to 100')
+    from x120x_upsd import Settings
+    path = Path(path)
+    original = path.read_text()
+    settings = Settings.load(path)
+    previous = settings.max_charge_capacity
+    settings.max_charge_capacity = limit
+    settings.validate()
+    target = f'{limit:g}'
+    print(f'Configuration: {path}\n'
+          f'Change saved charge target from {previous:g}% to {target}%.\n'
+          f'Charging control remains {"ON" if settings.control_charging else "OFF"}.\n'
+          f'When enabled, charging stops at {target}% and may resume at {limit-3:g}%.\n'
+          f'Additional voltage ceiling remains {settings.max_voltage:g}V (0 means disabled).\n'
+          'Voltage/temperature limits and gauge accuracy may prevent the target being reached.\n'
+          'An enabled controller may start or stop charging immediately after this change.\n'
+          'A lower target does not actively discharge the batteries.\n'
+          'Shutdown timer/cutoffs, Telegram, fan and input permissions are preserved.\n'
+          'This restarts the UPS service; its boot enablement and elapsed outage time are preserved.')
+    if not settings.control_charging:
+        print('The target is saved only. Charging control must be enabled separately.')
+    if ask('Confirmation 1 of 2 - save this charge target? Type yes: ').strip().lower() != 'yes':
+        return False
+    phrase = f'SET CHARGE TARGET TO {target}%'
+    if ask(f'Confirmation 2 of 2 - type exactly "{phrase}": ').strip() != phrase:
+        return False
+    return save_settings(path, original, {'max_charge_capacity': target}, 'charge-target', apply_service)
+
+
 def save_settings(path, original, changes, action, apply_service):
     # Abort if a second editor changed anything while the user was confirming.
     if path.read_text() != original:
@@ -263,6 +296,7 @@ def main():
     actions.add_parser('enable-charging').add_argument('--limit', type=int, default=80)
     actions.add_parser('enable-shutdown').add_argument('--minutes', type=float, required=True)
     actions.add_parser('set-shutdown-time').add_argument('--minutes', type=float, required=True)
+    actions.add_parser('set-charge-target').add_argument('--limit', type=int, required=True)
     fan_parser=actions.add_parser('set-fan-curve')
     fan_parser.add_argument('--temperatures',required=True,help='Four comma-separated Celsius thresholds')
     fan_parser.add_argument('--speeds',required=True,help='Four comma-separated PWM percentages')
@@ -292,6 +326,11 @@ def main():
             completed = set_shutdown_time(path, args.minutes, apply_service=restart_service)
             if not completed:
                 print('Cancelled. No settings were changed.')
+                return 2
+        elif args.action == 'set-charge-target':
+            completed = set_charge_target(path, args.limit, apply_service=restart_service)
+            if not completed:
+                print('Cancelled. No charge target changed.')
                 return 2
         elif args.action == 'set-fan-curve':
             from x120x_fan import FanCurve,parse_values,apply_curve
@@ -332,7 +371,7 @@ def main():
         return 0
     except EOFError:
         print('\nCancelled before completing confirmation. No settings were changed.')
-        return 0
+        return 2
     except KeyboardInterrupt:
         print('\nInterrupted. If both confirmations were completed, check the saved configuration and service status.')
         return 1

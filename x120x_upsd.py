@@ -349,7 +349,8 @@ def minutes_since_boot():
     return float(Path('/proc/uptime').read_text().split()[0]) / 60
 
 
-def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups', stop_event=None):
+def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups', stop_event=None,
+                battery_history_path='/var/lib/x120x-ups/battery-performance.json'):
     settings.validate()
     stop = stop_event if stop_event is not None else threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -371,9 +372,17 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
     scheduler = None
     telegram = None
     telegram_state = 'disabled'
+    battery_performance = None
+    battery_performance_state = 'unavailable'
     try:
         previous = restore_state(status_path, boot_id)
         hardware = hardware_factory(settings)
+        try:
+            from x120x_battery_health import BatteryPerformance
+            battery_performance = BatteryPerformance(battery_history_path,
+                                                     max_gap=max(60, settings.poll_seconds * 3))
+        except Exception:
+            print('Battery performance history unavailable; UPS protection continues.', flush=True)
         if settings.telegram_enabled:
             try:
                 from x120x_telegram import TelegramCredentials, TelegramNotifier
@@ -403,6 +412,16 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
                           telegram_heartbeat_enabled=settings.telegram_heartbeat_enabled,
                           telegram_heartbeat_hours=settings.telegram_heartbeat_hours,
                           telegram_heartbeat_start=settings.telegram_heartbeat_start)
+            if battery_performance is not None:
+                try:
+                    battery_performance.observe(report, now)
+                    report['battery_performance'] = battery_performance.status()
+                except Exception:
+                    battery_performance = None
+                    battery_performance_state = 'storage_error'
+                    print('Battery performance recording failed; UPS protection continues.', flush=True)
+            if battery_performance is None:
+                report['battery_performance'] = dict(state=battery_performance_state)
             if telegram is not None:
                 try:
                     telegram.observe(report)
@@ -443,6 +462,13 @@ def run_service(settings, hardware_factory=Hardware, runtime_dir='/run/x120x-ups
         raise
     finally:
         notify('STOPPING=1')
+        if battery_performance is not None:
+            try:
+                if report.get('health') == 'ok':
+                    battery_performance.finish()
+                    report['battery_performance'] = battery_performance.status()
+            except Exception:
+                print('Battery performance history could not be saved; UPS protection unchanged.', flush=True)
         try:
             if report.get('health') == 'ok':
                 atomic_json(status_path, dict(report, health='stopped'))
